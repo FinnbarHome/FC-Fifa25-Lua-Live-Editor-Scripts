@@ -30,8 +30,25 @@ local config = {
         CAM = "attacker", ST = "attacker", RW = "attacker", LW = "attacker"
     },
     alternative_positions = {
-        RW = {"RM"}, LW = {"LM"}, ST = {"RW", "LW"},
-        CDM = {"CM"}, CAM = {"RW", "LW"}
+        RW = {"RM"}, 
+        LW = {"LM"}, 
+        ST = {"RW", "LW"},
+        CDM = {"CM"}, 
+        CAM = {"RW", "LW"}
+    },
+    positions_to_roles = {
+        GK = {1, 2, 0}, -- Eg: 1,2,0 Goalkeeper, Sweeperkeeper, None
+        CB = {11, 12, 13}, -- Eg: 11,12,13 Defender, Stopper, Ball-playing Defender
+        RB = {3, 4, 5}, -- Eg: 3,4,5 Fullback, Falseback, Wingback
+        LB = {7, 8, 9}, -- Eg; 7,8,9 Fullback, Falseback, Wingback
+        CDM = {14, 15, 16}, -- Eg: 14,15,16 Holding, Centre-half, Deep-lying Playmaker
+        RM = {23, 24, 26}, -- Eg: 23,24,26 Winger, Wide Midfielder, Inside Forward
+        CM = {18, 19, 20}, -- Eg: 18,19,20 Box-to-box, Holding, Deep-lying Playmaker
+        LM = {27, 28, 30}, -- Eg: 27,28,30 Winger, Wide Midfielder, Inside Forward
+        CAM = {31, 32, 33}, -- Eg: 31,32,33 Playmaker, Shadow Striker, Half-Winger
+        ST = {41, 42, 43}, -- Eg: 41,42,43 Advanced Forward, Poacher, False Nine 
+        RW = {35, 36, 37}, -- Eg: 35,36,37 Winger, Inside Forward, Wide Playmaker
+        LW = {38, 39, 40} -- Eg: 38,39,40 Winger, Inside Forward, Wide Playmaker
     },
     league_constraints = setmetatable({
         [61] = {min_overall = 58, max_overall = 64, min_potential = 65, max_potential = 99},
@@ -372,22 +389,47 @@ local function update_player_preferred_position_1(player_id, new_role_id_1)
             players_table_global:SetRecordFieldValue(players_table_record, "preferredposition1", new_role_id_1)
             LOGGER:LogInfo(string.format("Updated player %d's preferred position 1 to %d.", player_id, new_role_id_1))
 
-            -- if a gk set 2nd and 3rd role as nothing
+            -- if a gk set 2nd and 3rd role as nothing and 1st as gk (0)
             if new_role_id_1 == 0 then
+                LOGGER:LogInfo(string.format("Player %d is a gk setting preferred positon to gk with 2 and 3 as nothing", player_id))
+                players_table_global:SetRecordFieldValue(players_table_record, "preferredposition1", 0)
                 players_table_global:SetRecordFieldValue(players_table_record, "preferredposition2", -1)
-                LOGGER:LogInfo(string.format("Updated player %d's preferred position 2 to %d.", player_id, -1))
                 players_table_global:SetRecordFieldValue(players_table_record, "preferredposition3", -1)
-                LOGGER:LogInfo(string.format("Updated player %d's preferred position 3 to %d.", player_id, -1))
+                return
             end
 
             -- If the player's preferred position 2 or 3 is the new role, update it to the old role 
             if player_preferred_position_2 == new_role_id_1 then
                 players_table_global:SetRecordFieldValue(players_table_record, "preferredposition2", old_role_id)
+                LOGGER:LogInfo(string.format("Updated player %d's preferred position 2 to the old role (%d)", player_id, old_role_id))
             end
             if player_preferred_position_3 == new_role_id_1 then
                 players_table_global:SetRecordFieldValue(players_table_record, "preferredposition3", old_role_id)
+                LOGGER:LogInfo(string.format("Updated player %d's preferred position 3 to the old role (%d)", player_id, old_role_id))
             end
 
+            return
+        end
+        players_table_record = players_table_global:GetNextValidRecord()
+    end
+    LOGGER:LogWarning(string.format("Player record for ID %d not found. Could not update preferred position.", player_id))
+end
+
+local function update_all_player_roles(player_id, new_role_id_1, new_role_id_2, new_role_id_3)
+    local players_table_record = players_table_global:GetFirstRecord()
+    while players_table_record > 0 do
+        local current_player_id = players_table_global:GetRecordFieldValue(players_table_record, "playerid")
+        if current_player_id == player_id then
+            local current_players_pos = players_table_global:GetRecordFieldValue(players_table_record, "preferredposition1")
+            -- if a gk set 3rd role as nothing
+            if current_players_pos == 0 then
+                new_role_id_3 = 0
+            end
+
+            players_table_global:SetRecordFieldValue(players_table_record, "role1", new_role_id_1)
+            players_table_global:SetRecordFieldValue(players_table_record, "role2", new_role_id_2)
+            players_table_global:SetRecordFieldValue(players_table_record, "role3", new_role_id_3)
+            LOGGER:LogInfo(string.format("Updated player %d's roles to %d,%d and %d.", player_id, new_role_id_1, new_role_id_2, new_role_id_3))
             return
         end
         players_table_record = players_table_global:GetNextValidRecord()
@@ -413,6 +455,7 @@ local function handle_player_transfer(player_id, team_id, role_required, league_
         if used_alternative then
             LOGGER:LogInfo(string.format("Used alternative position '%s' instead of '%s'.", alternative_role_used, role_required))
             update_player_preferred_position_1(player_id, get_role_id_from_role_name(role_required))
+            update_all_player_roles(player_id, config.positions_to_roles[alternative_role_used][1], config.positions_to_roles[alternative_role_used][2], config.positions_to_roles[alternative_role_used][3])
         end
 
         table.remove(free_agents_list, candidate_index)

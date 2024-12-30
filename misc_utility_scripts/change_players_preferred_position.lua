@@ -34,12 +34,9 @@ local function update_player_preferred_position_1(player_id, new_role_id_1)
                 players_table_global:SetRecordFieldValue(players_table_record, "preferredposition3", -1)
                 return
             end
-            
-            LOGGER:LogInfo("here")
 
             -- If the player's preferred position 2 or 3 is the new role, update it to the old role 
             if player_preferred_position_2 == new_role_id_1 then
-
                 players_table_global:SetRecordFieldValue(players_table_record, "preferredposition2", old_role_id)
                 LOGGER:LogInfo(string.format("Updated player %d's preferred position 2 to the old role (%d)", player_id, old_role_id))
             end
