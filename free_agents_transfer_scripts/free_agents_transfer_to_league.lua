@@ -71,8 +71,8 @@ for role_name, id_list in pairs(config.position_ids) do
     end
 end
 
-local function get_role_name_from_position_id(posID)
-    return position_name_by_id[posID] or ("UnknownPos(".. tostring(posID) ..")")
+local function get_role_name_from_position_id(position_id)
+    return position_name_by_id[position_id] or ("UnknownPos(".. tostring(position_id) ..")")
 end
 
 -- Compute Age from Birthdate
@@ -248,7 +248,7 @@ local function get_all_teams_and_needs()
             end
 
             for _, role_name in ipairs(team_needs_cache[team_id]) do
-                table.insert(all_entries, { teamId = team_id, role = role_name, leagueId = league_id, weight = 10 })
+                table.insert(all_entries, { team_id = team_id, role = role_name, league_id = league_id, weight = 10 })
             end
         end
     end
@@ -306,9 +306,9 @@ local function filter_free_agents(team_player_links, player_data, results)
             if age >= config.age_constraints.min and age <= config.age_constraints.max then
                 for _, league_id in ipairs(config.target_leagues) do
                     local constraints = config.league_constraints[league_id]
-                    local minimum_overall, max_overall, minimum_potential, max_potential = constraints.min_overall, constraints.max_overall, constraints.min_potential, constraints.max_potential
-                    if data.overall >= minimum_overall and data.overall <= max_overall and
-                       data.potential >= minimum_potential and data.potential <= max_potential and
+                    local min_overall, max_overall, min_potential, max_potential = constraints.min_overall, constraints.max_overall, constraints.min_potential, constraints.max_potential
+                    if data.overall >= min_overall and data.overall <= max_overall and
+                       data.potential >= min_potential and data.potential <= max_potential and
                        data.roleName then
                         table.insert(results[league_id], { playerid = player_id, roleName = data.roleName })
                     end
@@ -359,16 +359,38 @@ local function find_candidate(free_agents_list, role_required)
     return nil
 end
 
-local function update_player_role(players_table, player_id, new_role_id)
-    local players_table_record = players_table:GetFirstRecord()
+local function update_player_preferred_position_1(player_id, new_role_id_1)
+    local players_table_record = players_table_global:GetFirstRecord()
+    
     while players_table_record > 0 do
-        local current_player_id = players_table:GetRecordFieldValue(players_table_record, "playerid")
+        local current_player_id = players_table_global:GetRecordFieldValue(players_table_record, "playerid")
         if current_player_id == player_id then
-            players_table:SetRecordFieldValue(players_table_record, "preferredposition1", new_role_id)
-            LOGGER:LogInfo(string.format("Updated player %d's preferred position to %d.", player_id, new_role_id))
+            local old_role_id = players_table_global:GetRecordFieldValue(players_table_record, "preferredposition1")
+            local player_preferred_position_2 = players_table_global:GetRecordFieldValue(players_table_record, "preferredposition2")
+            local player_preferred_position_3 = players_table_global:GetRecordFieldValue(players_table_record, "preferredposition3")
+
+            players_table_global:SetRecordFieldValue(players_table_record, "preferredposition1", new_role_id_1)
+            LOGGER:LogInfo(string.format("Updated player %d's preferred position 1 to %d.", player_id, new_role_id_1))
+
+            -- if a gk set 2nd and 3rd role as nothing
+            if new_role_id_1 == 0 then
+                players_table_global:SetRecordFieldValue(players_table_record, "preferredposition2", -1)
+                LOGGER:LogInfo(string.format("Updated player %d's preferred position 2 to %d.", player_id, -1))
+                players_table_global:SetRecordFieldValue(players_table_record, "preferredposition3", -1)
+                LOGGER:LogInfo(string.format("Updated player %d's preferred position 3 to %d.", player_id, -1))
+            end
+
+            -- If the player's preferred position 2 or 3 is the new role, update it to the old role 
+            if player_preferred_position_2 == new_role_id_1 then
+                players_table_global:SetRecordFieldValue(players_table_record, "preferredposition2", old_role_id)
+            end
+            if player_preferred_position_3 == new_role_id_1 then
+                players_table_global:SetRecordFieldValue(players_table_record, "preferredposition3", old_role_id)
+            end
+
             return
         end
-        players_table_record = players_table:GetNextValidRecord()
+        players_table_record = players_table_global:GetNextValidRecord()
     end
     LOGGER:LogWarning(string.format("Player record for ID %d not found. Could not update preferred position.", player_id))
 end
@@ -390,7 +412,7 @@ local function handle_player_transfer(player_id, team_id, role_required, league_
 
         if used_alternative then
             LOGGER:LogInfo(string.format("Used alternative position '%s' instead of '%s'.", alternative_role_used, role_required))
-            update_player_role(players_table_global, player_id, get_role_id_from_role_name(role_required))
+            update_player_preferred_position_1(player_id, get_role_id_from_role_name(role_required))
         end
 
         table.remove(free_agents_list, candidate_index)
@@ -419,7 +441,7 @@ end
 
 
 local function process_team_entry(entry, free_agents)
-    local team_id, role_required, league_id = entry.teamId, entry.role, entry.leagueId
+    local team_id, role_required, league_id = entry.team_id, entry.role, entry.league_id
 
     if get_team_size(team_id) >= config.squad_size then
         LOGGER:LogInfo(string.format("Team %d is full. Skipping.", team_id))
