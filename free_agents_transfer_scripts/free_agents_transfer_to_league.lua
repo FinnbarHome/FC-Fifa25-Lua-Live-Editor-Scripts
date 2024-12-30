@@ -455,7 +455,7 @@ local function handle_player_transfer(player_id, team_id, role_required, league_
         if used_alternative then
             LOGGER:LogInfo(string.format("Used alternative position '%s' instead of '%s'.", alternative_role_used, role_required))
             update_player_preferred_position_1(player_id, get_role_id_from_role_name(role_required))
-            update_all_player_roles(player_id, config.positions_to_roles[alternative_role_used][1], config.positions_to_roles[alternative_role_used][2], config.positions_to_roles[alternative_role_used][3])
+            update_all_player_roles(player_id, config.positions_to_roles[role_required][1], config.positions_to_roles[role_required][2], config.positions_to_roles[role_required][3])
         end
 
         table.remove(free_agents_list, candidate_index)
