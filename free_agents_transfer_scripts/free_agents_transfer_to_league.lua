@@ -7,7 +7,6 @@ require 'imports/career_mode/helpers'
 require 'imports/other/helpers'
 local logger = require("logger")
 
-
 local teamplayerlinks_global = LE.db:GetTable("teamplayerlinks")
 local players_table_global   = LE.db:GetTable("players")
 local formations_table_global = LE.db:GetTable("formations")
@@ -31,15 +30,6 @@ local position_ids = {
     ST = {25, 20, 21, 22, 24, 26},     -- Primary: 25
     RW = {23},                         -- Primary: 23
     LW = {27}                          -- Primary: 27
-}
-
--- Multi-league: user can define multiple league IDs in one run
-local TARGET_LEAGUE_IDS = {61,60,14}  -- Example usage: {61,60,14,13}
-
--- Teams to exclude from any process, useful if you don't want to transfer to your own team
-local EXCLUDED_TEAM_IDS = {
-    -- [12345] = true,
-    -- ...
 }
 
 --------------------------------------------------------------------------------
@@ -259,7 +249,7 @@ local function GetAllTeamsAndNeeds()
     while rec > 0 do
         local lgId = leagueteamlinks:GetRecordFieldValue(rec, "leagueid")
         local tmId = leagueteamlinks:GetRecordFieldValue(rec, "teamid")
-        if lgId and tmId and not EXCLUDED_TEAM_IDS[tmId] then
+        if lgId and tmId and not config.excluded_teams[tmId] then
             leagueTeams[lgId] = leagueTeams[lgId] or {}
             table.insert(leagueTeams[lgId], tmId)
         end
@@ -267,7 +257,7 @@ local function GetAllTeamsAndNeeds()
     end
 
     -- Process each league's teams
-    for _, leagueId in ipairs(TARGET_LEAGUE_IDS) do
+    for _, leagueId in ipairs(config.target_leagues) do
         local teams = leagueTeams[leagueId] or {}
         for _, tmId in ipairs(teams) do
             if not teamNeedsCache[tmId] then
@@ -337,7 +327,7 @@ local function filterFreeAgents(teamplayerlinks, playerData, results)
             local age = calculatePlayerAge(data.birthdate)
 
             if age >= config.age_constraints.min and age <= config.age_constraints.max then
-                for _, lgId in ipairs(TARGET_LEAGUE_IDS) do
+                for _, lgId in ipairs(config.target_leagues) do
                     local constraints = config.league_constraints[lgId]
                     local minOvr, maxOvr, minPot, maxPot = constraints.min_overall, constraints.max_overall, constraints.min_potential, constraints.max_potential
                     if data.overall >= minOvr and data.overall <= maxOvr and
@@ -354,7 +344,7 @@ local function filterFreeAgents(teamplayerlinks, playerData, results)
 end
 
 local function shuffleFreeAgents(results)
-    for _, lgId in ipairs(TARGET_LEAGUE_IDS) do
+    for _, lgId in ipairs(config.target_leagues) do
         local arr = results[lgId]
         for i = #arr, 2, -1 do
             local j = math.random(i)
@@ -365,7 +355,7 @@ end
 
 local function BuildFreeAgentsForLeagues()
     local results = {}
-    for _, lgId in ipairs(TARGET_LEAGUE_IDS) do
+    for _, lgId in ipairs(config.target_leagues) do
         results[lgId] = {}
     end
 
