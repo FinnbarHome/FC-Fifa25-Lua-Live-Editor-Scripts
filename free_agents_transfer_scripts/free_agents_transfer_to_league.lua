@@ -4,7 +4,6 @@
 --------------------------------------------------------------------------------
 require 'imports/career_mode/helpers'
 require 'imports/other/helpers'
-local stats_logger = require("stats_logger")
 local helper_methods = require("helper_methods")
 
 local players_table_global   = LE.db:GetTable("players")
@@ -62,8 +61,7 @@ local config = {
     },
 }
 
-local player_data = helper_methods.build_player_data(players_table_global) -- ADDED
-
+local player_data = helper_methods.build_player_data(players_table_global)
 --------------------------------------------------------------------------------
 -- FORMATION LOGIC: Retrieve each team's formation positions
 --------------------------------------------------------------------------------
@@ -105,7 +103,6 @@ local function compute_team_needs(team_id)
         demand[pos] = demand[pos]*2
     end
 
-    -- CHANGED: Now we pass 'player_data' to count_positions_in_team
     local current_positions = helper_methods.count_positions_in_team(team_id, team_player_links_global, player_data)
     
     local needed = {}
@@ -165,13 +162,9 @@ local function get_all_teams_and_needs()
     return all_entries
 end
 
-
-
-
 --------------------------------------------------------------------------------
 -- BUILD LIST OF ELIGIBLE FREE AGENTS FOR EACH LEAGUE
 --------------------------------------------------------------------------------
-
 local function build_free_agents()
     if not player_data or not team_player_links_global then
         return {}
@@ -205,8 +198,6 @@ local function build_free_agents()
     end
     return results
 end
-
-
 
 --------------------------------------------------------------------------------
 -- ACTUAL TRANSFER MECHANISM
@@ -275,7 +266,6 @@ local function process_team_entry(entry, free_agents_list)
         return false
     end
 
-    -- CHANGED: Now passing 'player_data' instead of 'overall_map'
     local lower_bound, upper_bound = helper_methods.get_team_lower_upper_bounds(team_id, team_player_links_global, player_data)
     if not lower_bound or not upper_bound then
         LOGGER:LogInfo(string.format("No rating stats for team %d; skipping %s.", team_id, req_pos))
@@ -331,7 +321,6 @@ end
 --------------------------------------------------------------------------------
 -- MAIN SCRIPT
 --------------------------------------------------------------------------------
-
 math.randomseed(os.time())
 LOGGER:LogInfo("Starting Multi-League Transfer Script...")
 

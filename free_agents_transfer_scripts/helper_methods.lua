@@ -1,6 +1,12 @@
+--------------------------------------------------------------------------------
+--- Helper methods for free agents transfer script
+--------------------------------------------------------------------------------
 require 'imports/career_mode/helpers'
 require 'imports/other/helpers'
 
+--------------------------------------------------------------------------------
+-- CONFIGURATION
+--------------------------------------------------------------------------------
 local position_ids = {
     GK={0}, CB={5,1,4,6}, RB={3,2}, LB={7,8}, CDM={10,9,11},
     RM={12}, CM={14,13,15}, LM={16}, CAM={18,17,19},
@@ -9,7 +15,9 @@ local position_ids = {
 
 local lower_bound_minus, upper_bound_plus = 2, 2
 
--- Build a position_id -> name map
+--------------------------------------------------------------------------------
+--- HELPER METHODS
+--------------------------------------------------------------------------------
 local position_name_by_id = {}
 for name, ids in pairs(position_ids) do
     for _, pid in ipairs(ids) do
@@ -25,8 +33,6 @@ local function get_position_name_from_position_id(pid)
     return position_name_by_id[pid] or ("UnknownPos(".. pid ..")")
 end
 
--- CHANGED: This function replaces build_player_maps + old cache approach
--- It builds a single "player_data" table: player_data[player_id] = { overall, potential, birthdate, ... }
 local function build_player_data(players_table)
     if not players_table then
         LOGGER:LogWarning("Players table not found. Could not build player data.")
@@ -126,9 +132,6 @@ local function update_player_preferred_position_1(player_id, new_pos_id, players
     LOGGER:LogWarning(string.format("Player %d not found. Could not update position.", player_id))
 end
 
-
-
--- CHANGED: Now expects 'player_data' instead of separate overall_map/position_map
 local function count_positions_in_team(team_id, team_player_links, player_data)
     local counts, rec = {}, team_player_links:GetFirstRecord()
     while rec>0 do
@@ -145,7 +148,6 @@ local function count_positions_in_team(team_id, team_player_links, player_data)
     return counts
 end
 
--- CHANGED: Now expects 'player_data' instead of 'overall_map'
 local function get_team_lower_upper_bounds(team_id, team_player_links, player_data)
     local ratings, rec = {}, team_player_links:GetFirstRecord()
     while rec>0 do
@@ -174,9 +176,8 @@ local function get_team_lower_upper_bounds(team_id, team_player_links, player_da
     return lb, ub
 end
 
--- CHANGED: Return build_player_data instead of build_player_maps
 return {
-    build_player_data = build_player_data, -- ADDED
+    build_player_data = build_player_data, 
     calculate_player_age = calculate_player_age,
     get_team_size = get_team_size,
     update_all_player_roles = update_all_player_roles,
