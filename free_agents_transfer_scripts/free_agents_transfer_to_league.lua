@@ -50,8 +50,8 @@ local config = {
     },
     age_constraints = {min = 16, max = 35},
     squad_size = 52,
-    target_leagues = {61,60,14}, -- Eg: 61 = EFL League Two, 60 = EFL League One, 14 = EFL Championship
-    excluded_teams = {}, -- Example: { [12345] = true }
+    target_leagues = {61,60,14,13,16,17,19,20,2076,31,32,10,83,53,54,353,351,80,4,2012,1,2149,41,66,308,65,330,350,50,56,189,68,39}, -- Eg: 61 = EFL League Two, 60 = EFL League One, 14 = EFL Championship, premier league, lig 1, lig 2, Bund, bund 2, bund 3, erd, k league, Liga 1, liga 2, argentinan prem, A league, O.Bund, 1A pro l, CSL, 3F Sup L, ISL, Eliteserien, PKO BP Eks, liga port, SSE Airtricity, Superliga, Saudi L, Scot prem, Allsven, CSSL, super lig, MLS
+    excluded_teams = { [113926] = true },         -- e.g. { [1234] = true }
     transfer = {
         sum = 0,
         wage = 600,

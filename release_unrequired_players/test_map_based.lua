@@ -1,5 +1,5 @@
 --------------------------------------------------------------------------------
--- Team Formation Position Management Script with Position-Count-Based Max
+-- Team Formation Position Management Script (Improvement #1: One-Pass Lookup)
 --------------------------------------------------------------------------------
 require 'imports/career_mode/helpers'
 require 'imports/other/helpers'
@@ -16,8 +16,8 @@ local league_team_links_global = LE.db:GetTable("leagueteamlinks")
 -- CONFIG
 --------------------------------------------------------------------------------
 local config = {
-    target_leagues = {61,60,14,13,16,17,19,20,2076,31,32,10,83,53,54,353,351,80,4,2012,1,2149,41,66,308,65,330,350,50,56,189,68,39}, -- Eg: 61 = EFL League Two, 60 = EFL League One, 14 = EFL Championship, premier league, lig 1, lig 2, Bund, bund 2, bund 3, erd, k league, Liga 1, liga 2, argentinan prem, A league, O.Bund, 1A pro l, CSL, 3F Sup L, ISL, Eliteserien, PKO BP Eks, liga port, SSE Airtricity, Superliga, Saudi L, Scot prem, Allsven, CSSL, super lig, MLS
-    excluded_teams = {},         -- e.g. { [1234] = true }
+    target_leagues = {61,60,14,13,16,17,19,20,2076,31,32,10,83,53,54,353,351,80,4,2012,1,2149,41,66,308,65,330,350,50,56,189,68,39},
+    excluded_teams = {},
 
     alternative_positions = {
         RW = {"RM"},
@@ -33,7 +33,6 @@ local config = {
         CDM={14,15,16}, RM={23,24,26}, CM={18,19,20}, LM={27,28,30},
         CAM={31,32,33}, ST={41,42,43}, RW={35,36,37}, LW={38,39,40}
     },
-
 
     multiplier = 3
 }
@@ -60,6 +59,29 @@ end
 
 local function get_position_name_from_position_id(pid)
     return position_name_by_id[pid] or ("UnknownPos(".. tostring(pid) ..")")
+end
+
+--------------------------------------------------------------------------------
+-- (1) Build a One-Pass Player Data Map
+--------------------------------------------------------------------------------
+local function build_player_data_map(players_table)
+    local map = {}
+    local rec = players_table:GetFirstRecord()
+    while rec > 0 do
+        local pid = players_table:GetRecordFieldValue(rec, "playerid")
+        if pid then
+            local overall = players_table:GetRecordFieldValue(rec, "overallrating")
+                           or players_table:GetRecordFieldValue(rec, "overall")
+                           or 0
+            local prefPos = players_table:GetRecordFieldValue(rec, "preferredposition1") or 0
+            map[pid] = {
+                overall      = overall,
+                preferredPos = prefPos
+            }
+        end
+        rec = players_table:GetNextValidRecord()
+    end
+    return map
 end
 
 --------------------------------------------------------------------------------
@@ -121,7 +143,6 @@ end
 --------------------------------------------------------------------------------
 -- GET FORMATION POSITIONS
 --------------------------------------------------------------------------------
--- Returns a table of e.g. {"GK","CB","CB","ST","CM",...}
 local function get_formation_positions(team_id)
     if not formations_table_global then
         return {}
@@ -145,42 +166,34 @@ local function get_formation_positions(team_id)
 end
 
 --------------------------------------------------------------------------------
--- GET TEAM PLAYERS
+-- get_team_players
 --------------------------------------------------------------------------------
-local function get_team_players(team_id)
+local function get_team_players(team_id, team_player_links, player_data_map)
     local players = {}
-    local link_rec = team_player_links_global:GetFirstRecord()
+    local link_rec = team_player_links:GetFirstRecord()
     while link_rec>0 do
-        local t_id = team_player_links_global:GetRecordFieldValue(link_rec,"teamid")
-        local p_id = team_player_links_global:GetRecordFieldValue(link_rec,"playerid")
+        local t_id = team_player_links:GetRecordFieldValue(link_rec,"teamid")
+        local p_id = team_player_links:GetRecordFieldValue(link_rec,"playerid")
+
         if t_id==team_id then
-            -- loop players table to find that player_id
-            local p_scan = players_table_global:GetFirstRecord()
-            while p_scan>0 do
-                local pid = players_table_global:GetRecordFieldValue(p_scan,"playerid")
-                if pid==p_id then
-                    local pref_pos = players_table_global:GetRecordFieldValue(p_scan,"preferredposition1") or 0
-                    local pos_name = get_position_name_from_position_id(pref_pos)
-                    local overall  = players_table_global:GetRecordFieldValue(p_scan,"overallrating")
-                                   or players_table_global:GetRecordFieldValue(p_scan,"overall")
-                                   or 0
-                    players[#players+1] = {
-                        id       = pid,
-                        posName  = pos_name,
-                        overall  = overall
-                    }
-                    break
-                end
-                p_scan= players_table_global:GetNextValidRecord()
+            local pdata = player_data_map[p_id]
+            if pdata then
+                local pos_name = get_position_name_from_position_id(pdata.preferredPos)
+                players[#players+1] = {
+                    id      = p_id,
+                    posName = pos_name,
+                    overall = pdata.overall
+                }
             end
         end
-        link_rec= team_player_links_global:GetNextValidRecord()
+
+        link_rec= team_player_links:GetNextValidRecord()
     end
     return players
 end
 
 --------------------------------------------------------------------------------
--- ATTEMPT CONVERSION (Step 2)
+-- ATTEMPT CONVERSION
 --------------------------------------------------------------------------------
 local function try_convert_player(player_id, old_posName, formation_set)
     local alt_list = config.alternative_positions[old_posName]
@@ -205,49 +218,46 @@ local function try_convert_player(player_id, old_posName, formation_set)
 end
 
 --------------------------------------------------------------------------------
--- RELEASE A PLAYER (Step 3)
+-- RELEASE A PLAYER 
 --------------------------------------------------------------------------------
 local function release_player(player_id, team_id)
     ReleasePlayerFromTeam(player_id)
     local player_name = GetPlayerName(player_id)
     local team_name = GetTeamName(team_id)
-    LOGGER:LogInfo(string.format("Released player %s (ID: %d) from %s (ID: %d).", player_name, player_id, team_name, team_id))
+    LOGGER:LogInfo(string.format("Released player %s (ID: %d) from %s (ID: %d).", 
+        player_name, player_id, team_name, team_id))
 end
 
 --------------------------------------------------------------------------------
 -- PROCESS ONE TEAM
 --------------------------------------------------------------------------------
-local function process_team(team_id)
+local function process_team(team_id, player_data_map)
     local team_name = GetTeamName(team_id)
     LOGGER:LogInfo(string.format("Processing team %s (%d)...", team_name, team_id))
 
-    -- 1) Grab formation positions
     local formation_positions = get_formation_positions(team_id)
     if #formation_positions==0 then
         LOGGER:LogInfo(string.format("No formation found for team %s. Skipping steps.", team_name))
         return
     end
 
-    -- Build a set for quick membership checks, plus a count
     local formation_set = {}
-    local formation_count = {}  -- e.g. {ST=2, GK=1, CB=2, ...}
+    local formation_count = {}
     for _,posName in ipairs(formation_positions) do
         formation_set[posName] = true
         formation_count[posName] = (formation_count[posName] or 0) + 1
     end
 
     -- 2) Convert any player not in the formation
-    local players_list = get_team_players(team_id)
+    local players_list = get_team_players(team_id, team_player_links_global, player_data_map)
     for _, ply in ipairs(players_list) do
         if not formation_set[ply.posName] then
-            -- Attempt conversion
-            local success = try_convert_player(ply.id, ply.posName, formation_set)
-            -- If not success, will do final check in next step
+            try_convert_player(ply.id, ply.posName, formation_set)
         end
     end
 
     -- 3) Release leftover mismatches
-    players_list = get_team_players(team_id) -- re-grab
+    players_list = get_team_players(team_id, team_player_links_global, player_data_map) -- re-grab
     for _, ply in ipairs(players_list) do
         if not formation_set[ply.posName] then
             release_player(ply.id, team_id)
@@ -255,11 +265,11 @@ local function process_team(team_id)
     end
 
     -- 4) Limit each position to "formation_count * config.multiplier"
-    players_list = get_team_players(team_id)
+    players_list = get_team_players(team_id, team_player_links_global, player_data_map)
     local grouped = {}
     for _, ply in ipairs(players_list) do
         grouped[ply.posName] = grouped[ply.posName] or {}
-        table.insert(grouped[ply.posName], ply)
+        grouped[ply.posName][#grouped[ply.posName]+1] = ply
     end
 
     for posName, arr in pairs(grouped) do
@@ -267,19 +277,16 @@ local function process_team(team_id)
         if demand_for_pos>0 then
             local max_for_pos = demand_for_pos * config.multiplier
             if #arr> max_for_pos then
-                -- Sort ascending by overall rating
                 table.sort(arr, function(a,b) return a.overall < b.overall end)
                 local excess = #arr - max_for_pos
                 for i=1,excess do
                     release_player(arr[i].id, team_id)
                 end
                 LOGGER:LogInfo(string.format(
-                    "Position %s had %d players, demanded %d in formation => max %d, released %d lowest overalls.",
+                    "Position %s had %d players, demanded %d => max %d, released %d lowest overalls.",
                     posName, #arr, demand_for_pos, max_for_pos, excess
                 ))
             end
-        else
-
         end
     end
 
@@ -322,6 +329,8 @@ end
 -- MAIN
 --------------------------------------------------------------------------------
 local function do_position_changes()
+    local player_data_map = build_player_data_map(players_table_global)
+
     local team_pool = build_team_pool()
     if #team_pool==0 then
         LOGGER:LogInfo("No teams found in target leagues. Exiting.")
@@ -333,7 +342,7 @@ local function do_position_changes()
     ))
 
     for _, team_id in ipairs(team_pool) do
-        process_team(team_id)
+        process_team(team_id, player_data_map)
     end
     LOGGER:LogInfo("Done processing all target teams.")
 end
@@ -342,6 +351,6 @@ end
 -- RUN SCRIPT
 --------------------------------------------------------------------------------
 math.randomseed(os.time())
-LOGGER:LogInfo("Starting Team Formation Position Management Script...")
+LOGGER:LogInfo("Starting Team Formation Position Management Script... (with One-Pass Lookup)")
 
 do_position_changes()
