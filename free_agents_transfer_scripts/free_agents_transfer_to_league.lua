@@ -59,6 +59,8 @@ local config = {
         release_clause = -1,
         from_team_id = 111592
     },
+    lower_bound_minus = 2, -- This is the range that the script subtracts from the lower bounds of the team's ratings.
+    upper_bound_plus = 2 -- This is the range that the script adds to the upper bounds of the team's ratings.
 }
 
 local player_data = helper_methods.build_player_data(players_table_global)
@@ -266,7 +268,7 @@ local function process_team_entry(entry, free_agents_list)
         return false
     end
 
-    local lower_bound, upper_bound = helper_methods.get_team_lower_upper_bounds(team_id, team_player_links_global, player_data)
+    local lower_bound, upper_bound = helper_methods.get_team_lower_upper_bounds(team_id, team_player_links_global, player_data, config.lower_bound_minus, config.upper_bound_plus)
     if not lower_bound or not upper_bound then
         LOGGER:LogInfo(string.format("No rating stats for team %d; skipping %s.", team_id, req_pos))
         return false

@@ -13,7 +13,6 @@ local position_ids = {
     ST={25,20,21,22,24,26}, RW={23}, LW={27}
 }
 
-local lower_bound_minus, upper_bound_plus = 2, 2
 
 --------------------------------------------------------------------------------
 --- HELPER METHODS
@@ -148,7 +147,7 @@ local function count_positions_in_team(team_id, team_player_links, player_data)
     return counts
 end
 
-local function get_team_lower_upper_bounds(team_id, team_player_links, player_data)
+local function get_team_lower_upper_bounds(team_id, team_player_links, player_data, lower_bound_minus, upper_bound_plus)
     local ratings, rec = {}, team_player_links:GetFirstRecord()
     while rec>0 do
         local t_id= team_player_links:GetRecordFieldValue(rec,"teamid")

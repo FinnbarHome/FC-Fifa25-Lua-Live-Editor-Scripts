@@ -1,5 +1,5 @@
 --------------------------------------------------------------------------------
--- Team Formation Position Management Script (Improvement #1: One-Pass Lookup)
+-- Team Formation Position Management Script
 --------------------------------------------------------------------------------
 require 'imports/career_mode/helpers'
 require 'imports/other/helpers'
