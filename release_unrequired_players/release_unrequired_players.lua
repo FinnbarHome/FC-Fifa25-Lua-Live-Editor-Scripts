@@ -11,6 +11,7 @@ local players_table_global     = LE.db:GetTable("players")
 local team_player_links_global = LE.db:GetTable("teamplayerlinks")
 local formations_table_global  = LE.db:GetTable("formations")
 local league_team_links_global = LE.db:GetTable("leagueteamlinks")
+local playerloans_table_global = LE.db:GetTable("playerloans")
 
 --------------------------------------------------------------------------------
 -- CONFIG
@@ -34,8 +35,13 @@ local config = {
         CAM={31,32,33}, ST={41,42,43}, RW={35,36,37}, LW={38,39,40}
     },
 
-
-    multiplier = 3
+    multiplier = 3,
+    
+    -- Youth development settings
+    protect_youth = true,             -- Set to false to disable youth protection
+    youth_max_age = 23,               -- Maximum age to be considered a youth player
+    youth_potential_bonus = 2,        -- How many points above median team rating the potential must be
+    youth_max_protected_per_pos = 1   -- Maximum number of youth players to protect per position
 }
 
 --------------------------------------------------------------------------------
@@ -47,15 +53,18 @@ local position_ids = {
     ST={25,20,21,22,24,26}, RW={23}, LW={27}
 }
 
+-- Pre-compute position mappings for faster lookups
 local position_name_by_id = {}
+local position_id_by_name = {}
 for name, ids in pairs(position_ids) do
+    position_id_by_name[name] = ids[1]
     for _, pid in ipairs(ids) do
         position_name_by_id[pid] = name
     end
 end
 
 local function get_position_id_from_position_name(pos_name)
-    return (position_ids[pos_name] or {})[1]
+    return position_id_by_name[pos_name] or -1
 end
 
 local function get_position_name_from_position_id(pid)
@@ -63,59 +72,159 @@ local function get_position_name_from_position_id(pid)
 end
 
 --------------------------------------------------------------------------------
--- Update Position + Roles
+-- CACHES AND INDEXES
 --------------------------------------------------------------------------------
-local function update_player_preferred_position_1(player_id, new_pos_id, players_table)
-    local rec = players_table:GetFirstRecord()
-    while rec>0 do
-        local current_pid = players_table:GetRecordFieldValue(rec,"playerid")
-        if current_pid==player_id then
-            local old = players_table:GetRecordFieldValue(rec,"preferredposition1")
-            local pos2= players_table:GetRecordFieldValue(rec,"preferredposition2")
-            local pos3= players_table:GetRecordFieldValue(rec,"preferredposition3")
+local player_cache = {}
+local teams_processed = {}
+local formation_cache = {}
+local team_median_ratings = {}
+local loaned_players = {}
 
-            players_table:SetRecordFieldValue(rec,"preferredposition1", new_pos_id)
-            LOGGER:LogInfo(string.format("Updated player %d pos1 to %d.", player_id, new_pos_id))
-
-            if new_pos_id==0 then
-                LOGGER:LogInfo(string.format("Player %d is GK -> clearing pos2/pos3.", player_id))
-                players_table:SetRecordFieldValue(rec,"preferredposition2",-1)
-                players_table:SetRecordFieldValue(rec,"preferredposition3",-1)
-                return
-            end
-            if pos2==new_pos_id then
-                players_table:SetRecordFieldValue(rec,"preferredposition2", old)
-                LOGGER:LogInfo(string.format("Swapped pos2 with old pos1(%d).", old))
-            end
-            if pos3==new_pos_id then
-                players_table:SetRecordFieldValue(rec,"preferredposition3", old)
-                LOGGER:LogInfo(string.format("Swapped pos3 with old pos1(%d).", old))
-            end
-            return
-        end
-        rec= players_table:GetNextValidRecord()
+--------------------------------------------------------------------------------
+-- HELPER FUNCTIONS - Need to be defined first to avoid circular dependencies
+--------------------------------------------------------------------------------
+local function calculate_player_age(birth_date)
+    if not birth_date or birth_date <= 0 then return 30 end
+    local c = GetCurrentDate()
+    local d = DATE:new(); d:FromGregorianDays(birth_date)
+    local age = c.year - d.year
+    if c.month < d.month or (c.month==d.month and c.day<d.day) then
+        age = age - 1
     end
-    LOGGER:LogWarning(string.format("Player %d not found. Could not update position.", player_id))
+    return age
 end
 
-local function update_all_player_roles(player_id, r1, r2, r3, players_table)
-    local rec = players_table:GetFirstRecord()
-    while rec>0 do
-        local current_pid = players_table:GetRecordFieldValue(rec,"playerid")
-        if current_pid==player_id then
-            local pos = players_table:GetRecordFieldValue(rec,"preferredposition1")
-            if pos==0 then
-                r3=0
-            end
-            players_table:SetRecordFieldValue(rec,"role1",r1)
-            players_table:SetRecordFieldValue(rec,"role2",r2)
-            players_table:SetRecordFieldValue(rec,"role3",r3)
-            LOGGER:LogInfo(string.format("Updated player %d's roles to %d,%d,%d.", player_id, r1, r2, r3))
-            return
-        end
-        rec = players_table:GetNextValidRecord()
+local function index_players_by_id()
+    if next(player_cache) ~= nil then 
+        return -- Already indexed
     end
-    LOGGER:LogWarning(string.format("Player %d not found. Could not update roles.", player_id))
+    
+    local rec = players_table_global:GetFirstRecord()
+    while rec > 0 do
+        local pid = players_table_global:GetRecordFieldValue(rec, "playerid")
+        if pid then
+            local birthdate = players_table_global:GetRecordFieldValue(rec, "birthdate")
+            player_cache[pid] = {
+                record = rec,
+                preferredposition1 = players_table_global:GetRecordFieldValue(rec, "preferredposition1"),
+                overall = players_table_global:GetRecordFieldValue(rec, "overallrating") or 
+                          players_table_global:GetRecordFieldValue(rec, "overall") or 0,
+                potential = players_table_global:GetRecordFieldValue(rec, "potential") or 0,
+                age = calculate_player_age(birthdate),
+                birthdate = birthdate
+            }
+        end
+        rec = players_table_global:GetNextValidRecord()
+    end
+end
+
+--------------------------------------------------------------------------------
+-- LOAN PLAYERS TRACKING
+--------------------------------------------------------------------------------
+local function build_loan_players_index()
+    if next(loaned_players) ~= nil then
+        return -- Already built
+    end
+    
+    LOGGER:LogInfo("Building loan players index...")
+    local count = 0
+    
+    if not playerloans_table_global then
+        LOGGER:LogWarning("No playerloans table found.")
+        return
+    end
+    
+    local rec = playerloans_table_global:GetFirstRecord()
+    while rec > 0 do
+        local player_id = playerloans_table_global:GetRecordFieldValue(rec, "playerid")
+        local loaned_from_team = playerloans_table_global:GetRecordFieldValue(rec, "teamidloanedfrom")
+        
+        if player_id and loaned_from_team then
+            loaned_players[player_id] = loaned_from_team
+            count = count + 1
+        end
+        
+        rec = playerloans_table_global:GetNextValidRecord()
+    end
+    
+    LOGGER:LogInfo(string.format("Found %d players currently on loan", count))
+end
+
+local function is_player_on_loan_from(player_id, team_id)
+    return loaned_players[player_id] == team_id
+end
+
+--------------------------------------------------------------------------------
+-- GET TEAM PLAYERS - Define this function early to avoid circular dependency
+--------------------------------------------------------------------------------
+local function get_team_players(team_id)
+    local players = {}
+    local link_rec = team_player_links_global:GetFirstRecord()
+    
+    -- Make sure players are indexed and loans are tracked
+    index_players_by_id()
+    build_loan_players_index()
+    
+    while link_rec > 0 do
+        local t_id = team_player_links_global:GetRecordFieldValue(link_rec, "teamid")
+        local p_id = team_player_links_global:GetRecordFieldValue(link_rec, "playerid")
+        
+        if t_id == team_id then
+            -- Skip players who are on loan to other teams
+            if is_player_on_loan_from(p_id, team_id) then
+                LOGGER:LogInfo(string.format("Skipping player %d who is on loan from team %d", p_id, team_id))
+            else
+                local cached_player = player_cache[p_id]
+                if cached_player then
+                    local pref_pos = cached_player.preferredposition1 or 0
+                    local pos_name = get_position_name_from_position_id(pref_pos)
+                    players[#players + 1] = {
+                        id = p_id,
+                        posName = pos_name,
+                        overall = cached_player.overall,
+                        potential = cached_player.potential,
+                        age = cached_player.age
+                    }
+                end
+            end
+        end
+        link_rec = team_player_links_global:GetNextValidRecord()
+    end
+    return players
+end
+
+--------------------------------------------------------------------------------
+-- Calculate Team Median Rating 
+--------------------------------------------------------------------------------
+local function calculate_team_median_rating(team_id)
+    if team_median_ratings[team_id] then
+        return team_median_ratings[team_id]
+    end
+    
+    local players_list = get_team_players(team_id)
+    if #players_list == 0 then
+        return 65 -- Default value if no players found
+    end
+    
+    local ratings = {}
+    for _, player in ipairs(players_list) do
+        table.insert(ratings, player.overall)
+    end
+    
+    table.sort(ratings)
+    local median
+    if #ratings % 2 == 0 then
+        median = (ratings[#ratings/2] + ratings[#ratings/2 + 1]) / 2
+    else
+        median = ratings[math.ceil(#ratings/2)]
+    end
+    
+    -- Ensure median is stored as integer for proper string formatting
+    median = math.floor(median + 0.5)
+    team_median_ratings[team_id] = median
+    
+    LOGGER:LogInfo(string.format("Team %d median rating calculated: %d", team_id, median))
+    return median
 end
 
 --------------------------------------------------------------------------------
@@ -123,70 +232,123 @@ end
 --------------------------------------------------------------------------------
 -- Returns a table of e.g. {"GK","CB","CB","ST","CM",...}
 local function get_formation_positions(team_id)
+    if formation_cache[team_id] then
+        return formation_cache[team_id]
+    end
+    
     if not formations_table_global then
+        formation_cache[team_id] = {}
         return {}
     end
+    
     local rec = formations_table_global:GetFirstRecord()
-    while rec>0 do
-        local f_team_id = formations_table_global:GetRecordFieldValue(rec,"teamid")
-        if f_team_id==team_id then
-            local positions={}
-            for i=0,10 do
+    while rec > 0 do
+        local f_team_id = formations_table_global:GetRecordFieldValue(rec, "teamid")
+        if f_team_id == team_id then
+            local positions = {}
+            for i = 0, 10 do
                 local field_name = ("position%d"):format(i)
                 local pos_id = formations_table_global:GetRecordFieldValue(rec, field_name) or 0
                 local pos_name = get_position_name_from_position_id(pos_id)
-                positions[#positions+1] = pos_name
+                positions[#positions + 1] = pos_name
             end
+            formation_cache[team_id] = positions
             return positions
         end
-        rec= formations_table_global:GetNextValidRecord()
+        rec = formations_table_global:GetNextValidRecord()
     end
+    
+    formation_cache[team_id] = {}
     return {}
 end
 
 --------------------------------------------------------------------------------
--- GET TEAM PLAYERS
+-- Update Position + Roles
 --------------------------------------------------------------------------------
-local function get_team_players(team_id)
-    local players = {}
-    local link_rec = team_player_links_global:GetFirstRecord()
-    while link_rec>0 do
-        local t_id = team_player_links_global:GetRecordFieldValue(link_rec,"teamid")
-        local p_id = team_player_links_global:GetRecordFieldValue(link_rec,"playerid")
-        if t_id==team_id then
-            -- loop players table to find that player_id
-            local p_scan = players_table_global:GetFirstRecord()
-            while p_scan>0 do
-                local pid = players_table_global:GetRecordFieldValue(p_scan,"playerid")
-                if pid==p_id then
-                    local pref_pos = players_table_global:GetRecordFieldValue(p_scan,"preferredposition1") or 0
-                    local pos_name = get_position_name_from_position_id(pref_pos)
-                    local overall  = players_table_global:GetRecordFieldValue(p_scan,"overallrating")
-                                   or players_table_global:GetRecordFieldValue(p_scan,"overall")
-                                   or 0
-                    players[#players+1] = {
-                        id       = pid,
-                        posName  = pos_name,
-                        overall  = overall
-                    }
-                    break
-                end
-                p_scan= players_table_global:GetNextValidRecord()
-            end
-        end
-        link_rec= team_player_links_global:GetNextValidRecord()
+local function update_player_preferred_position_1(player_id, new_pos_id, players_table)
+    local player = player_cache[player_id]
+    if not player then
+        LOGGER:LogWarning(string.format("Player %d not found in cache. Could not update position.", player_id))
+        return
     end
-    return players
+
+    local rec = player.record
+    local old = players_table:GetRecordFieldValue(rec, "preferredposition1")
+    local pos2 = players_table:GetRecordFieldValue(rec, "preferredposition2")
+    local pos3 = players_table:GetRecordFieldValue(rec, "preferredposition3")
+
+    players_table:SetRecordFieldValue(rec, "preferredposition1", new_pos_id)
+    LOGGER:LogInfo(string.format("Updated player %d pos1 to %d.", player_id, new_pos_id))
+    
+    -- Update our cache
+    player.preferredposition1 = new_pos_id
+
+    if new_pos_id == 0 then
+        LOGGER:LogInfo(string.format("Player %d is GK -> clearing pos2/pos3.", player_id))
+        players_table:SetRecordFieldValue(rec, "preferredposition2", -1)
+        players_table:SetRecordFieldValue(rec, "preferredposition3", -1)
+        return
+    end
+    if pos2 == new_pos_id then
+        players_table:SetRecordFieldValue(rec, "preferredposition2", old)
+        LOGGER:LogInfo(string.format("Swapped pos2 with old pos1(%d).", old))
+    end
+    if pos3 == new_pos_id then
+        players_table:SetRecordFieldValue(rec, "preferredposition3", old)
+        LOGGER:LogInfo(string.format("Swapped pos3 with old pos1(%d).", old))
+    end
+end
+
+local function update_all_player_roles(player_id, r1, r2, r3, players_table)
+    local player = player_cache[player_id]
+    if not player then
+        LOGGER:LogWarning(string.format("Player %d not found in cache. Could not update roles.", player_id))
+        return
+    end
+
+    local rec = player.record
+    local pos = players_table:GetRecordFieldValue(rec, "preferredposition1")
+    if pos == 0 then
+        r3 = 0
+    end
+    players_table:SetRecordFieldValue(rec, "role1", r1)
+    players_table:SetRecordFieldValue(rec, "role2", r2)
+    players_table:SetRecordFieldValue(rec, "role3", r3)
+    LOGGER:LogInfo(string.format("Updated player %d's roles to %d,%d,%d.", player_id, r1, r2, r3))
+end
+
+--------------------------------------------------------------------------------
+-- YOUTH PLAYER PROTECTION
+--------------------------------------------------------------------------------
+local function is_high_potential_youth(player, team_median_rating)
+    if not config.protect_youth then
+        return false
+    end
+    
+    -- Check if this is a young player
+    if player.age > config.youth_max_age then
+        return false
+    end
+    
+    -- Check if potential is significantly above median
+    local potential_threshold = team_median_rating + config.youth_potential_bonus
+    return player.potential >= potential_threshold
 end
 
 --------------------------------------------------------------------------------
 -- ATTEMPT CONVERSION (Step 2)
 --------------------------------------------------------------------------------
 local function try_convert_player(player_id, old_posName, formation_set)
+    -- Don't try to convert loaned players
+    if loaned_players[player_id] then
+        return false
+    end
+    
     local alt_list = config.alternative_positions[old_posName]
     if not alt_list then
         return false
     end
+    
     for _, alt_pos in ipairs(alt_list) do
         if formation_set[alt_pos] then
             -- Convert to alt_pos
@@ -208,48 +370,64 @@ end
 -- RELEASE A PLAYER (Step 3)
 --------------------------------------------------------------------------------
 local function release_player(player_id, team_id)
+    -- Never release loaned players
+    if loaned_players[player_id] then
+        LOGGER:LogInfo(string.format("Skipping release of player %d who is on loan from team %d", player_id, team_id))
+        return false
+    end
+    
     ReleasePlayerFromTeam(player_id)
     local player_name = GetPlayerName(player_id)
     local team_name = GetTeamName(team_id)
     LOGGER:LogInfo(string.format("Released player %s (ID: %d) from %s (ID: %d).", player_name, player_id, team_name, team_id))
+    return true
 end
 
 --------------------------------------------------------------------------------
 -- PROCESS ONE TEAM
 --------------------------------------------------------------------------------
 local function process_team(team_id)
+    if teams_processed[team_id] then
+        return -- Skip already processed teams
+    end
+    
     local team_name = GetTeamName(team_id)
     LOGGER:LogInfo(string.format("Processing team %s (%d)...", team_name, team_id))
 
     -- 1) Grab formation positions
     local formation_positions = get_formation_positions(team_id)
-    if #formation_positions==0 then
+    if #formation_positions == 0 then
         LOGGER:LogInfo(string.format("No formation found for team %s. Skipping steps.", team_name))
+        teams_processed[team_id] = true
         return
     end
 
     -- Build a set for quick membership checks, plus a count
     local formation_set = {}
     local formation_count = {}  -- e.g. {ST=2, GK=1, CB=2, ...}
-    for _,posName in ipairs(formation_positions) do
+    for _, posName in ipairs(formation_positions) do
         formation_set[posName] = true
         formation_count[posName] = (formation_count[posName] or 0) + 1
     end
+
+    -- Calculate team median rating for high potential youth detection
+    local team_median = calculate_team_median_rating(team_id)
 
     -- 2) Convert any player not in the formation
     local players_list = get_team_players(team_id)
     for _, ply in ipairs(players_list) do
         if not formation_set[ply.posName] then
-            -- Attempt conversion
-            local success = try_convert_player(ply.id, ply.posName, formation_set)
-            -- If not success, will do final check in next step
+            -- Attempt conversion for ALL players, including high potential youth
+            try_convert_player(ply.id, ply.posName, formation_set)
+            -- Success or failure handled in next step
         end
     end
 
-    -- 3) Release leftover mismatches
+    -- 3) Release leftover mismatches (including high potential youth that couldn't be converted)
     players_list = get_team_players(team_id) -- re-grab
     for _, ply in ipairs(players_list) do
         if not formation_set[ply.posName] then
+            -- Release any player not in formation, regardless of potential
             release_player(ply.id, team_id)
         end
     end
@@ -264,54 +442,141 @@ local function process_team(team_id)
 
     for posName, arr in pairs(grouped) do
         local demand_for_pos = formation_count[posName] or 0
-        if demand_for_pos>0 then
+        if demand_for_pos > 0 then
             local max_for_pos = demand_for_pos * config.multiplier
-            if #arr> max_for_pos then
-                -- Sort ascending by overall rating
-                table.sort(arr, function(a,b) return a.overall < b.overall end)
-                local excess = #arr - max_for_pos
-                for i=1,excess do
-                    release_player(arr[i].id, team_id)
+            
+            if #arr > max_for_pos then
+                -- Sort all players by overall first (descending)
+                table.sort(arr, function(a, b) 
+                    return a.overall > b.overall 
+                end)
+                
+                -- Calculate how many slots in the last third are available for youth
+                local regular_slots = math.floor(max_for_pos * 2/3)
+                local youth_eligible_slots = max_for_pos - regular_slots
+                local youth_slots_filled = 0
+                
+                -- Identify potential high-potential youth in the lower 2/3 of the array
+                local youth_candidates = {}
+                for i = regular_slots + 1, #arr do
+                    if is_high_potential_youth(arr[i], team_median) then
+                        table.insert(youth_candidates, {
+                            player = arr[i],
+                            index = i
+                        })
+                    end
                 end
+                
+                -- Sort youth candidates by potential (descending)
+                table.sort(youth_candidates, function(a, b)
+                    return a.player.potential > b.player.potential
+                end)
+                
+                -- Track which players to keep
+                local players_to_keep = {}
+                for i = 1, regular_slots do
+                    players_to_keep[arr[i].id] = true
+                end
+                
+                -- Add high potential youth up to the limit
+                local youth_added = 0
+                for i = 1, math.min(youth_eligible_slots, #youth_candidates) do
+                    local candidate = youth_candidates[i]
+                    players_to_keep[candidate.player.id] = true
+                    youth_added = youth_added + 1
+                    
+                    LOGGER:LogInfo(string.format(
+                        "Protected youth player %d (OVR: %d, POT: %d, Age: %d) in position %s",
+                        candidate.player.id, candidate.player.overall, 
+                        candidate.player.potential, candidate.player.age, posName
+                    ))
+                end
+                
+                -- Fill remaining slots with next highest overall players
+                local filled_count = regular_slots + youth_added
+                if filled_count < max_for_pos then
+                    for i = regular_slots + 1, #arr do
+                        if not players_to_keep[arr[i].id] and filled_count < max_for_pos then
+                            players_to_keep[arr[i].id] = true
+                            filled_count = filled_count + 1
+                        end
+                    end
+                end
+                
+                -- Release players not in the keep list
+                local released = 0
+                for _, player in ipairs(arr) do
+                    if not players_to_keep[player.id] then
+                        if release_player(player.id, team_id) then
+                            released = released + 1
+                            
+                            -- Log release of high potential youth
+                            if is_high_potential_youth(player, team_median) then
+                                LOGGER:LogInfo(string.format(
+                                    "Released youth player %d (OVR: %d, POT: %d, Age: %d) - not in top %d slots for %s",
+                                    player.id, player.overall, player.potential, player.age, 
+                                    max_for_pos, posName
+                                ))
+                            end
+                        end
+                    end
+                end
+                
                 LOGGER:LogInfo(string.format(
-                    "Position %s had %d players, demanded %d in formation => max %d, released %d lowest overalls.",
-                    posName, #arr, demand_for_pos, max_for_pos, excess
+                    "Position %s had %d players, kept %d top overall and %d high potential youth, released %d",
+                    posName, #arr, regular_slots, youth_added, released
                 ))
             end
-        else
-
         end
     end
 
     LOGGER:LogInfo(string.format("Done processing team %s (%d).", team_name, team_id))
+    teams_processed[team_id] = true
 end
 
 --------------------------------------------------------------------------------
 -- BUILD TEAM POOL
 --------------------------------------------------------------------------------
+local league_team_map = {}
+
 local function build_team_pool()
+    if next(league_team_map) ~= nil then
+        -- Use cached league-team map if available
+        local pool = {}
+        for _, league_id in ipairs(config.target_leagues) do
+            local teams_in_league = league_team_map[league_id] or {}
+            for _, t_id in ipairs(teams_in_league) do
+                if not config.excluded_teams[t_id] then
+                    pool[#pool + 1] = t_id
+                end
+            end
+        end
+        return pool
+    end
+    
     local pool = {}
     if not league_team_links_global then
         LOGGER:LogWarning("No league_team_links table found. Pool will be empty.")
         return pool
     end
 
-    local league_map = {}
     local rec = league_team_links_global:GetFirstRecord()
-    while rec>0 do
-        local league_id = league_team_links_global:GetRecordFieldValue(rec,"leagueid")
-        local t_id      = league_team_links_global:GetRecordFieldValue(rec,"teamid")
-        if league_id and t_id and not config.excluded_teams[t_id] then
-            league_map[league_id] = league_map[league_id] or {}
-            league_map[league_id][#league_map[league_id]+1] = t_id
+    while rec > 0 do
+        local league_id = league_team_links_global:GetRecordFieldValue(rec, "leagueid")
+        local t_id = league_team_links_global:GetRecordFieldValue(rec, "teamid")
+        if league_id and t_id then
+            league_team_map[league_id] = league_team_map[league_id] or {}
+            league_team_map[league_id][#league_team_map[league_id] + 1] = t_id
         end
-        rec= league_team_links_global:GetNextValidRecord()
+        rec = league_team_links_global:GetNextValidRecord()
     end
 
-    for _, wanted_league_id in ipairs(config.target_leagues) do
-        local teams_in_league = league_map[wanted_league_id] or {}
+    for _, league_id in ipairs(config.target_leagues) do
+        local teams_in_league = league_team_map[league_id] or {}
         for _, t_id in ipairs(teams_in_league) do
-            pool[#pool+1] = t_id
+            if not config.excluded_teams[t_id] then
+                pool[#pool + 1] = t_id
+            end
         end
     end
 
@@ -322,14 +587,20 @@ end
 -- MAIN
 --------------------------------------------------------------------------------
 local function do_position_changes()
+    -- Pre-index all players for faster lookups
+    index_players_by_id()
+    
+    -- Build loan players index
+    build_loan_players_index()
+    
     local team_pool = build_team_pool()
-    if #team_pool==0 then
+    if #team_pool == 0 then
         LOGGER:LogInfo("No teams found in target leagues. Exiting.")
         return
     end
     LOGGER:LogInfo(string.format(
         "Collected %d teams from leagues: %s",
-        #team_pool, table.concat(config.target_leagues,", ")
+        #team_pool, table.concat(config.target_leagues, ", ")
     ))
 
     for _, team_id in ipairs(team_pool) do
