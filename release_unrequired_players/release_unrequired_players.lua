@@ -155,7 +155,7 @@ local function is_player_on_loan_from(player_id, team_id)
 end
 
 --------------------------------------------------------------------------------
--- GET TEAM PLAYERS - Define this function early to avoid circular dependency
+-- GET TEAM PLAYERS
 --------------------------------------------------------------------------------
 local function get_team_players(team_id)
     local players = {}
