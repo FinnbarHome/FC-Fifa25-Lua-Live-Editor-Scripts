@@ -2,20 +2,17 @@
 -- Lua Script for Multi-League Player Transfers
 -- with Position IDs Mapping, Priority Queue, and League-Specific Constraints
 --------------------------------------------------------------------------------
-
 require 'imports/career_mode/helpers'
 require 'imports/other/helpers'
-local logger = require("logger")
 
-local team_player_links_global = LE.db:GetTable("teamplayerlinks")
 local players_table_global   = LE.db:GetTable("players")
+local team_player_links_global = LE.db:GetTable("teamplayerlinks")
 local formations_table_global = LE.db:GetTable("formations")
 local league_team_links_global = LE.db:GetTable("leagueteamlinks")
 
 --------------------------------------------------------------------------------
 -- CONFIGURATION
 --------------------------------------------------------------------------------
-
 local config = {
     position_ids = {
         GK = {0}, CB = {5, 1, 4, 6}, RB = {3, 2}, LB = {7, 8},
@@ -50,66 +47,260 @@ local config = {
         RW = {35, 36, 37}, -- Eg: 35,36,37 Winger, Inside Forward, Wide Playmaker
         LW = {38, 39, 40} -- Eg: 38,39,40 Winger, Inside Forward, Wide Playmaker
     },
-    league_constraints = setmetatable({
-        [61] = {min_overall = 58, max_overall = 64, min_potential = 65, max_potential = 99},
-        [60] = {min_overall = 65, max_overall = 69, min_potential = 65, max_potential = 99},
-        [14] = {min_overall = 70, max_overall = 74, min_potential = 70, max_potential = 99},
-        [13] = {min_overall = 74, max_overall = 99, min_potential = 74, max_potential = 99}
-    }, { __index = function()
-        return {min_overall = 55, max_overall = 90, min_potential = 55, max_potential = 99}
-    end }),
     age_constraints = {min = 16, max = 35},
     squad_size = 52,
-    target_leagues = {61}, -- Eg: 61 = EFL League Two, 60 = EFL League One, 14 = EFL Championship
-    excluded_teams = {}, -- Example: { [12345] = true }
+    target_leagues = {61,60,14,13,16,17,19,20,2076,31,32,10,83,53,54,353,351,80,4,2012,1,2149,41,66,308,65,330,350,50,56,189,68,39}, -- Eg: 61 = EFL League Two, 60 = EFL League One, 14 = EFL Championship, premier league, lig 1, lig 2, Bund, bund 2, bund 3, erd, k league, Liga 1, liga 2, argentinan prem, A league, O.Bund, 1A pro l, CSL, 3F Sup L, ISL, Eliteserien, PKO BP Eks, liga port, SSE Airtricity, Superliga, Saudi L, Scot prem, Allsven, CSSL, super lig, MLS
+    excluded_teams = { [110] = true },         -- e.g. { [1234] = true }
     transfer = {
         sum = 0,
         wage = 600,
         contract_length = 60,
         release_clause = -1,
         from_team_id = 111592
-    }
+    },
+    lower_bound_minus = 2, -- This is the range that the script subtracts from the lower bounds of the team's ratings.
+    upper_bound_plus = 2 -- This is the range that the script adds to the upper bounds of the team's ratings.
 }
--- Call the logger function
--- logger.logConfigSummary(config)
 
---------------------------------------------------------------------------------
--- HELPER FUNCTIONS
---------------------------------------------------------------------------------
-local function get_position_id_from_position_name(position_req)
-    return (config.position_ids[position_req] or {})[1]
-end
-
--- Map Position ID to Position Name
+-- Pre-compute position mappings for faster lookups
 local position_name_by_id = {}
-for position_name, id_list in pairs(config.position_ids) do
-    for _, pos_id in ipairs(id_list) do
-        position_name_by_id[pos_id] = position_name
+local position_id_by_name = {}
+for name, ids in pairs(config.position_ids) do
+    position_id_by_name[name] = ids[1]
+    for _, pid in ipairs(ids) do
+        position_name_by_id[pid] = name
     end
 end
 
-local function get_position_name_from_position_id(position_id)
-    return position_name_by_id[position_id] or ("UnknownPos(".. tostring(position_id) ..")")
+--------------------------------------------------------------------------------
+-- HELPER METHODS
+--------------------------------------------------------------------------------
+local function get_position_id_from_position_name(req)
+    return position_id_by_name[req] or -1
 end
 
--- Compute Age from Birthdate
+local function get_position_name_from_position_id(pid)
+    return position_name_by_id[pid] or ("UnknownPos(".. pid ..")")
+end
+
 local function calculate_player_age(birth_date)
-    if not birth_date or birth_date <= 0 then return 20 end -- Default age
-    local current_date = GetCurrentDate()
-    local date = DATE:new()
-    date:FromGregorianDays(birth_date)
-    local age = current_date.year - date.year
-    if (current_date.month < date.month) or (current_date.month == date.month and current_date.day < date.day) then
+    if not birth_date or birth_date <= 0 then return 20 end
+    local c = GetCurrentDate()
+    local d = DATE:new(); d:FromGregorianDays(birth_date)
+    local age = c.year - d.year
+    if c.month < d.month or (c.month==d.month and c.day<d.day) then
         age = age - 1
     end
     return age
 end
 
+-- Cache team sizes for performance
+local team_size_cache = {}
+local function get_team_size(team_id, team_player_links)
+    if team_size_cache[team_id] then
+        return team_size_cache[team_id]
+    end
+    
+    if not team_player_links then return 0 end
+    local count, rec = 0, team_player_links:GetFirstRecord()
+    while rec>0 do
+        if team_player_links:GetRecordFieldValue(rec,"teamid")==team_id then
+            count = count+1
+        end
+        rec=team_player_links:GetNextValidRecord()
+    end
+    
+    team_size_cache[team_id] = count
+    return count
+end
+
+local function update_all_player_roles(player_id, r1, r2, r3, players_table)
+    local rec = players_table:GetFirstRecord()
+    while rec>0 do
+        if players_table:GetRecordFieldValue(rec,"playerid")==player_id then
+            local pos = players_table:GetRecordFieldValue(rec,"preferredposition1")
+            if pos==0 then r3=0 end
+            players_table:SetRecordFieldValue(rec,"role1",r1)
+            players_table:SetRecordFieldValue(rec,"role2",r2)
+            players_table:SetRecordFieldValue(rec,"role3",r3)
+            LOGGER:LogInfo(string.format("Updated player %d's roles to %d,%d,%d.", player_id, r1, r2, r3))
+            return
+        end
+        rec = players_table:GetNextValidRecord()
+    end
+    LOGGER:LogWarning(string.format("Player %d not found. Could not update roles.", player_id))
+end
+
+local function update_player_preferred_position_1(player_id, new_pos_id, players_table)
+    local rec = players_table:GetFirstRecord()
+    while rec>0 do
+        if players_table:GetRecordFieldValue(rec,"playerid")==player_id then
+            local old = players_table:GetRecordFieldValue(rec,"preferredposition1")
+            local pos2= players_table:GetRecordFieldValue(rec,"preferredposition2")
+            local pos3= players_table:GetRecordFieldValue(rec,"preferredposition3")
+            players_table:SetRecordFieldValue(rec,"preferredposition1", new_pos_id)
+            LOGGER:LogInfo(string.format("Updated player %d pos1 to %d.", player_id, new_pos_id))
+
+            if new_pos_id==0 then
+                LOGGER:LogInfo(string.format("Player %d is GK -> clearing pos2/pos3.", player_id))
+                players_table:SetRecordFieldValue(rec,"preferredposition2",-1)
+                players_table:SetRecordFieldValue(rec,"preferredposition3",-1)
+                return
+            end
+            if pos2==new_pos_id then
+                players_table:SetRecordFieldValue(rec,"preferredposition2", old)
+                LOGGER:LogInfo(string.format("Swapped pos2 with old pos1(%d).", old))
+            end
+            if pos3==new_pos_id then
+                players_table:SetRecordFieldValue(rec,"preferredposition3", old)
+                LOGGER:LogInfo(string.format("Swapped pos3 with old pos1(%d).", old))
+            end
+            return
+        end
+        rec= players_table:GetNextValidRecord()
+    end
+    LOGGER:LogWarning(string.format("Player %d not found. Could not update position.", player_id))
+end
+
+-- Pre-index players by ID for faster lookups
+local function build_player_data(players_table)
+    if not players_table then
+        LOGGER:LogWarning("Players table not found. Could not build player data.")
+        return {}
+    end
+    local player_data = {}
+    local player_by_position = {}
+    
+    local rec = players_table:GetFirstRecord()
+    while rec > 0 do
+        local pid = players_table:GetRecordFieldValue(rec, "playerid")
+        if pid then
+            local rating = players_table:GetRecordFieldValue(rec, "overallrating") or 0
+            local potential = players_table:GetRecordFieldValue(rec, "potential") or 0
+            local birthdate = players_table:GetRecordFieldValue(rec, "birthdate")
+            local pref_pos  = players_table:GetRecordFieldValue(rec, "preferredposition1")
+            local pos_name = pref_pos and get_position_name_from_position_id(pref_pos) or nil
+            
+            -- Store player data by ID
+            player_data[pid] = {
+                overall = rating,
+                potential = potential,
+                birthdate = birthdate,
+                preferredposition1 = pref_pos,
+                positionName = pos_name,
+                age = calculate_player_age(birthdate)
+            }
+            
+            -- Also index by position
+            if pos_name then
+                player_by_position[pos_name] = player_by_position[pos_name] or {}
+                table.insert(player_by_position[pos_name], {
+                    playerid = pid,
+                    overall = rating,
+                    potential = potential,
+                    age = player_data[pid].age
+                })
+            end
+        end
+        rec = players_table:GetNextValidRecord()
+    end
+    
+    return player_data, player_by_position
+end
+
+-- Cache position counts for each team
+local team_positions_cache = {}
+local function count_positions_in_team(team_id, team_player_links, player_data)
+    if team_positions_cache[team_id] then
+        return team_positions_cache[team_id]
+    end
+    
+    local counts, rec = {}, team_player_links:GetFirstRecord()
+    while rec>0 do
+        if team_player_links:GetRecordFieldValue(rec,"teamid")==team_id then
+            local p_id = team_player_links:GetRecordFieldValue(rec,"playerid")
+            local pdata= player_data[p_id]
+            if pdata and pdata.preferredposition1 then
+                local name = get_position_name_from_position_id(pdata.preferredposition1)
+                counts[name] = (counts[name] or 0)+1
+            end
+        end
+        rec=team_player_links:GetNextValidRecord()
+    end
+    
+    team_positions_cache[team_id] = counts
+    return counts
+end
+
+-- Cache team rating bounds
+local team_bounds_cache = {}
+local function get_team_lower_upper_bounds(team_id, team_player_links, player_data, lower_bound_minus, upper_bound_plus)
+    if team_bounds_cache[team_id] then
+        return team_bounds_cache[team_id][1], team_bounds_cache[team_id][2]
+    end
+
+    local ratings, rec = {}, team_player_links:GetFirstRecord()
+    while rec>0 do
+        local t_id= team_player_links:GetRecordFieldValue(rec,"teamid")
+        if t_id==team_id then
+            local p_id= team_player_links:GetRecordFieldValue(rec,"playerid")
+            local pdata= player_data[p_id]
+            if pdata then ratings[#ratings+1]= pdata.overall end
+        end
+        rec=team_player_links:GetNextValidRecord()
+    end
+    if #ratings==0 then
+        LOGGER:LogWarning(string.format("No ratings found for team %d.", team_id))
+        return nil, nil
+    end
+
+    table.sort(ratings)
+    local n=#ratings
+    local i50, i75= math.ceil(0.5*n), math.ceil(0.75*n)
+    local p50, p75= math.floor(ratings[i50]+0.5), math.floor(ratings[i75]+0.5)
+    local lb, ub= p50 - lower_bound_minus, p75 + upper_bound_plus
+
+    local team_name= GetTeamName(team_id)
+    LOGGER:LogInfo(string.format("Team %s(ID %d): 50%%=%d->LB:%d, 75%%=%d->UB:%d", 
+        team_name,team_id,p50,lb,p75,ub))
+        
+    team_bounds_cache[team_id] = {lb, ub}
+    return lb, ub
+end
+
+-- Initialize player data and position indexed data
+local player_data, player_positions_by_id = build_player_data(players_table_global)
+
+-- Map teams to leagues for faster lookups
+local league_teams_map = {}
+local function build_league_teams_map()
+    if next(league_teams_map) ~= nil then
+        return league_teams_map
+    end
+    
+    local record = league_team_links_global:GetFirstRecord()
+    while record>0 do
+        local league_id_field = league_team_links_global:GetRecordFieldValue(record,"leagueid")
+        local team_id_field   = league_team_links_global:GetRecordFieldValue(record,"teamid")
+        if league_id_field and team_id_field and not config.excluded_teams[team_id_field] then
+            league_teams_map[league_id_field] = league_teams_map[league_id_field] or {}
+            league_teams_map[league_id_field][#league_teams_map[league_id_field]+1] = team_id_field
+        end
+        record= league_team_links_global:GetNextValidRecord()
+    end
+    
+    return league_teams_map
+end
 
 --------------------------------------------------------------------------------
 -- FORMATION LOGIC: Retrieve each team's formation positions
 --------------------------------------------------------------------------------
+local formation_cache = {}
 local function get_formation_positions(target_team_id)
+    if formation_cache[target_team_id] then
+        return formation_cache[target_team_id]
+    end
+    
     if not formations_table_global then
         return {}
     end
@@ -119,110 +310,58 @@ local function get_formation_positions(target_team_id)
         local team_id_current = formations_table_global:GetRecordFieldValue(record, "teamid")
         if team_id_current == target_team_id then
             local positions = {}
-            for i = 0, 10 do
+            for i=0,10 do
                 local field_name = ("position%d"):format(i)
-                local position_id = formations_table_global:GetRecordFieldValue(record, field_name) or 0
-                local position_name = get_position_name_from_position_id(position_id)
-                table.insert(positions, position_name)
+                local position_id= formations_table_global:GetRecordFieldValue(record, field_name) or 0
+                local position_name= get_position_name_from_position_id(position_id)
+                positions[#positions+1] = position_name
             end
+            formation_cache[target_team_id] = positions
             return positions
         end
         record = formations_table_global:GetNextValidRecord()
     end
+    
+    formation_cache[target_team_id] = {}
     return {}
 end
 
 --------------------------------------------------------------------------------
--- COUNT HOW MANY PLAYERS PER POSITION A TEAM HAS
---------------------------------------------------------------------------------
-local function count_positions_in_team(target_team_id)
-    if not team_player_links_global or not players_table_global then
-        return {}
-    end
-
-    -- Cache all player positions
-    local player_position_map = {}
-    local player_record = players_table_global:GetFirstRecord()
-    while player_record > 0 do
-        local player_id = players_table_global:GetRecordFieldValue(player_record, "playerid")
-        local preferred_position_1 = players_table_global:GetRecordFieldValue(player_record, "preferredposition1")
-        if player_id and preferred_position_1 then
-            player_position_map[player_id] = preferred_position_1
-        end
-        player_record = players_table_global:GetNextValidRecord()
-    end
-
-    -- Count positions in the team
-    local position_count = {}
-    local record_team_player_links = team_player_links_global:GetFirstRecord()
-    while record_team_player_links > 0 do
-        local team_id = team_player_links_global:GetRecordFieldValue(record_team_player_links, "teamid")
-        local position_count_player_id = team_player_links_global:GetRecordFieldValue(record_team_player_links, "playerid")
-        if team_id == target_team_id and player_position_map[position_count_player_id] then
-            local position_name = get_position_name_from_position_id(player_position_map[position_count_player_id])
-            position_count[position_name] = (position_count[position_name] or 0) + 1
-        end
-        record_team_player_links = team_player_links_global:GetNextValidRecord()
-    end
-
-    return position_count
-end
-
-
---------------------------------------------------------------------------------
 -- TEAM NEEDS - Attempts to have 2 for every position in team's formation
 --------------------------------------------------------------------------------
+local team_needs_cache = {}
 local function compute_team_needs(team_id)
-    local formation_positions = get_formation_positions(team_id)  -- e.g. {"CB","ST","CB",...}
-    if #formation_positions == 0 then
-        return {}
+    if team_needs_cache[team_id] then
+        return team_needs_cache[team_id]
+    end
+    
+    local formation_positions = get_formation_positions(team_id)
+    if #formation_positions==0 then 
+        team_needs_cache[team_id] = {}
+        return {} 
     end
 
-    -- Tally how many positions the formation demands
     local demand = {}
-    for _, position_name in ipairs(formation_positions) do
-        demand[position_name] = (demand[position_name] or 0) + 1
+    for _,pos in ipairs(formation_positions) do
+        demand[pos] = (demand[pos] or 0) + 1
     end
-    -- Double each
-    for position_name in pairs(demand) do
-        demand[position_name] = demand[position_name] * 2
+    for pos in pairs(demand) do
+        demand[pos] = demand[pos]*2
     end
 
-    -- Check how many the team currently has
-    local current_positions = count_positions_in_team(team_id)
-
-    -- Build array of needed positions
-    local needed_slots = {}
-    for position_name, required_count in pairs(demand) do
-        local existing_count = current_positions[position_name] or 0
-        local missing_count = required_count - existing_count
-        if missing_count > 0 then
-            for _=1, missing_count do
-                table.insert(needed_slots, position_name)
-            end
+    local current_positions = count_positions_in_team(team_id, team_player_links_global, player_data)
+    
+    local needed = {}
+    for pos, required_count in pairs(demand) do
+        local existing = current_positions[pos] or 0
+        local missing = required_count - existing
+        for _=1, missing>0 and missing or 0 do
+            needed[#needed+1] = pos
         end
     end
-
-    return needed_slots
-end
-
---------------------------------------------------------------------------------
--- GETTEAMSIZE
---------------------------------------------------------------------------------
-local function get_team_size(team_id)
-    local team_player_links = team_player_links_global
-    if not team_player_links then return 0 end
-
-    local count = 0
-    local team_player_links_record = team_player_links:GetFirstRecord()
-    while team_player_links_record > 0 do
-        local team_id_field = team_player_links:GetRecordFieldValue(team_player_links_record, "teamid")
-        if team_id_field == team_id then
-            count = count + 1
-        end
-        team_player_links_record = team_player_links:GetNextValidRecord()
-    end
-    return count
+    
+    team_needs_cache[team_id] = needed
+    return needed
 end
 
 --------------------------------------------------------------------------------
@@ -230,234 +369,310 @@ end
 --------------------------------------------------------------------------------
 local function get_all_teams_and_needs()
     local league_team_links = league_team_links_global
-    if not league_team_links then
-        return {}
-    end
+    if not league_team_links then return {} end
 
     local all_entries = {}
-    local team_needs_cache = {}
+    local league_teams = build_league_teams_map()
 
-    -- Pre-cache league-team mapping
-    local league_teams = {}
-    local league_team_links_record = league_team_links:GetFirstRecord()
-    while league_team_links_record > 0 do
-        local league_id_field = league_team_links:GetRecordFieldValue(league_team_links_record, "leagueid")
-        local team_id_field = league_team_links:GetRecordFieldValue(league_team_links_record, "teamid")
-        if league_id_field and team_id_field and not config.excluded_teams[team_id_field] then
-            league_teams[league_id_field] = league_teams[league_id_field] or {}
-            table.insert(league_teams[league_id_field], team_id_field)
-        end
-        league_team_links_record = league_team_links:GetNextValidRecord()
-    end
-
-    -- Process each league's teams
     for _, league_id in ipairs(config.target_leagues) do
-        local teams = league_teams[league_id] or {}
-        for _, team_id in ipairs(teams) do
-            if not team_needs_cache[team_id] then
-                local team_size = get_team_size(team_id)
-                if team_size < config.squad_size then
-                    team_needs_cache[team_id] = compute_team_needs(team_id)
-                else
-                    team_needs_cache[team_id] = {}
-                    LOGGER:LogInfo(string.format("Team %d is full. Skipping all future needs.", team_id))
+        local teams_in_league = league_teams[league_id] or {}
+        for _, team_id in ipairs(teams_in_league) do
+            local size = get_team_size(team_id, team_player_links_global)
+            if size < config.squad_size then
+                local team_needs = compute_team_needs(team_id)
+                
+                for _, pos_name in ipairs(team_needs) do
+                    all_entries[#all_entries+1] = {
+                        team_id = team_id,
+                        position = pos_name,
+                        weight = 10
+                    }
                 end
-            end
-
-            for _, position_name in ipairs(team_needs_cache[team_id]) do
-                table.insert(all_entries, { team_id = team_id, position = position_name, league_id = league_id, weight = 10 })
+            else
+                LOGGER:LogInfo(string.format("Team %d is full. Skipping future needs.", team_id))
             end
         end
     end
 
-    table.sort(all_entries, function(a, b) return a.weight > b.weight end)
+    table.sort(all_entries, function(a,b) return a.weight>b.weight end)
     return all_entries
 end
-
-
 
 --------------------------------------------------------------------------------
 -- BUILD LIST OF ELIGIBLE FREE AGENTS FOR EACH LEAGUE
 --------------------------------------------------------------------------------
-
-local function cache_player_data(players_table)
-    local player_data = {}
-    local player_record = players_table:GetFirstRecord()
-
-    while player_record > 0 do
-        local player_id = players_table:GetRecordFieldValue(player_record, "playerid")
-        if player_id then
-            local overall = players_table:GetRecordFieldValue(player_record, "overallrating") or
-                            players_table:GetRecordFieldValue(player_record, "overall") or 0
-            local potential = players_table:GetRecordFieldValue(player_record, "potential") or 0
-            local birthdate = players_table:GetRecordFieldValue(player_record, "birthdate")
-            local preferred_position_1 = players_table:GetRecordFieldValue(player_record, "preferredposition1")
-
-            local position_name = preferred_position_1 and get_position_name_from_position_id(preferred_position_1) or nil
-            if position_name then
-                player_data[player_id] = {
-                    overall = overall,
-                    potential = potential,
-                    birthdate = birthdate,
-                    positionName = position_name
-                }
-            end
-        end
-        player_record = players_table:GetNextValidRecord()
+local function build_free_agents()
+    if not player_data or not team_player_links_global then
+        return {}, {}
     end
 
-    return player_data
-end
+    local results = {}
+    local position_index = {} -- To index free agents by position for quick lookup
+    local rec = team_player_links_global:GetFirstRecord()
+    
+    -- First pass: collect all eligible free agents
+    while rec > 0 do
+        local t_id = team_player_links_global:GetRecordFieldValue(rec, "teamid")
+        local p_id = team_player_links_global:GetRecordFieldValue(rec, "playerid")
+        local pdata = player_data[p_id]
 
-local function filter_free_agents(team_player_links, player_data, results)
-    local team_player_links_record = team_player_links:GetFirstRecord()
-
-    while team_player_links_record > 0 do
-        local team_id = team_player_links:GetRecordFieldValue(team_player_links_record, "teamid")
-        local player_id = team_player_links:GetRecordFieldValue(team_player_links_record, "playerid")
-
-        if team_id == config.transfer.from_team_id and player_data[player_id] then
-            local data = player_data[player_id]
-            local age = calculate_player_age(data.birthdate)
-
+        if t_id == config.transfer.from_team_id and pdata then
+            local age = pdata.age or calculate_player_age(pdata.birthdate)
             if age >= config.age_constraints.min and age <= config.age_constraints.max then
-                for _, league_id in ipairs(config.target_leagues) do
-                    local constraints = config.league_constraints[league_id]
-                    local min_overall, max_overall, min_potential, max_potential = constraints.min_overall, constraints.max_overall, constraints.min_potential, constraints.max_potential
-                    if data.overall >= min_overall and data.overall <= max_overall and
-                       data.potential >= min_potential and data.potential <= max_potential and
-                       data.positionName then
-                        table.insert(results[league_id], { playerid = player_id, positionName = data.positionName })
-                    end
+                local pos_name = pdata.positionName
+                local new_entry = {
+                    playerid = p_id,
+                    overall = pdata.overall,
+                    potential = pdata.potential,
+                    positionName = pos_name,
+                    age = age
+                }
+                
+                results[#results + 1] = new_entry
+                
+                -- Index by position
+                if pos_name then
+                    position_index[pos_name] = position_index[pos_name] or {}
+                    table.insert(position_index[pos_name], #results) -- Store index in results table
                 end
             end
         end
-
-        team_player_links_record = team_player_links:GetNextValidRecord()
+        rec = team_player_links_global:GetNextValidRecord()
     end
-end
 
-local function shuffle_free_agents(results)
-    for _, league_id in ipairs(config.target_leagues) do
-        local free_agents_list = results[league_id]
-        for current_index = #free_agents_list, 2, -1 do
-            local random_index = math.random(current_index)
-            free_agents_list[current_index], free_agents_list[random_index] = free_agents_list[random_index], free_agents_list[current_index]
+    -- Shuffle the results to avoid biases
+    for i = #results, 2, -1 do
+        local j = math.random(i)
+        results[i], results[j] = results[j], results[i]
+        
+        -- We've shuffled the data, so the position index is no longer valid
+        -- We'll rebuild it after shuffling
+    end
+    
+    -- Rebuild position index after shuffling
+    position_index = {}
+    for i, player in ipairs(results) do
+        local pos = player.positionName
+        if pos then
+            position_index[pos] = position_index[pos] or {}
+            table.insert(position_index[pos], i)
         end
     end
-end
-
-local function build_free_agents_for_leagues()
-    local results = {}
-    for _, league_id in ipairs(config.target_leagues) do
-        results[league_id] = {}
-    end
-
-    if not players_table_global or not team_player_links_global then
-        return results
-    end
-
-    local player_data = cache_player_data(players_table_global)
-    filter_free_agents(team_player_links_global, player_data, results)
-    shuffle_free_agents(results)
-
-    return results
+    
+    return results, position_index
 end
 
 --------------------------------------------------------------------------------
 -- ACTUAL TRANSFER MECHANISM
 --------------------------------------------------------------------------------
-local function find_candidate(free_agents_list, position_name)
-    for index, free_agent in ipairs(free_agents_list) do
+local function find_candidate(free_agents_list, position_index, position_name, min_rating, max_rating)
+    -- If we have an index for this position, use it for faster lookups
+    if position_index and position_index[position_name] then
+        for _, idx in ipairs(position_index[position_name]) do
+            local free_agent = free_agents_list[idx]
+            if free_agent.overall >= min_rating and free_agent.overall <= max_rating then
+                return idx
+            end
+        end
+        return nil
+    end
+    
+    -- Fallback to linear search if no index is available
+    for i, free_agent in ipairs(free_agents_list) do
         if free_agent.positionName == position_name then
-            return index
+            if free_agent.overall >= min_rating and free_agent.overall <= max_rating then
+                return i
+            end
         end
     end
     return nil
 end
 
-local function update_player_preferred_position_1(player_id, new_position_id_1)
-    local players_table_record = players_table_global:GetFirstRecord()
+local function find_alternative_candidate(free_agents_list, position_index, position_required, min_rating, max_rating)
+    local alternatives = config.alternative_positions[position_required]
+    if not alternatives then return nil, false, nil end
+
+    for _, alt_position in ipairs(alternatives) do
+        local idx = find_candidate(free_agents_list, position_index, alt_position, min_rating, max_rating)
+        if idx then
+            return idx, true, alt_position
+        end
+    end
+    return nil, false, nil
+end
+
+local function find_youth_potential_candidate(free_agents_list, position_index, position_required, upper_bound)
+    -- Look for high potential youth players (under 24) with potential above team's 75th percentile
+    local max_age = 24
+    local youth_candidates = {}
     
-    while players_table_record > 0 do
-        local current_player_id = players_table_global:GetRecordFieldValue(players_table_record, "playerid")
-        if current_player_id == player_id then
-            local old_position_id = players_table_global:GetRecordFieldValue(players_table_record, "preferredposition1")
-            local player_preferred_position_2 = players_table_global:GetRecordFieldValue(players_table_record, "preferredposition2")
-            local player_preferred_position_3 = players_table_global:GetRecordFieldValue(players_table_record, "preferredposition3")
-
-            players_table_global:SetRecordFieldValue(players_table_record, "preferredposition1", new_position_id_1)
-            LOGGER:LogInfo(string.format("Updated player %d's preferred position 1 to %d.", player_id, new_position_id_1))
-
-            -- if a gk set 2nd and 3rd position as nothing and 1st as gk (0)
-            if new_position_id_1 == 0 then
-                LOGGER:LogInfo(string.format("Player %d is a gk setting preferred positon to gk with 2 and 3 as nothing", player_id))
-                players_table_global:SetRecordFieldValue(players_table_record, "preferredposition1", 0)
-                players_table_global:SetRecordFieldValue(players_table_record, "preferredposition2", -1)
-                players_table_global:SetRecordFieldValue(players_table_record, "preferredposition3", -1)
-                return
+    -- If we have an index for this position, use it for faster lookups
+    if position_index and position_index[position_required] then
+        for _, idx in ipairs(position_index[position_required]) do
+            local free_agent = free_agents_list[idx]
+            if free_agent.age < max_age and free_agent.potential >= upper_bound then
+                youth_candidates[#youth_candidates + 1] = {
+                    index = idx,
+                    potential = free_agent.potential
+                }
             end
-
-            -- If the player's preferred position 2 or 3 is the new position, update it to the old position 
-            if player_preferred_position_2 == new_position_id_1 then
-                players_table_global:SetRecordFieldValue(players_table_record, "preferredposition2", old_position_id)
-                LOGGER:LogInfo(string.format("Updated player %d's preferred position 2 to the old position (%d)", player_id, old_position_id))
-            end
-            if player_preferred_position_3 == new_position_id_1 then
-                players_table_global:SetRecordFieldValue(players_table_record, "preferredposition3", old_position_id)
-                LOGGER:LogInfo(string.format("Updated player %d's preferred position 3 to the old position (%d)", player_id, old_position_id))
-            end
-
-            return
         end
-        players_table_record = players_table_global:GetNextValidRecord()
+        
+        -- Sort by potential (highest first)
+        if #youth_candidates > 0 then
+            table.sort(youth_candidates, function(a, b) return a.potential > b.potential end)
+            return youth_candidates[1].index, true
+        end
+    else
+        -- Fallback to linear search
+        for i, free_agent in ipairs(free_agents_list) do
+            if free_agent.positionName == position_required then
+                local age = free_agent.age or calculate_player_age(player_data[free_agent.playerid].birthdate)
+                if age < max_age and free_agent.potential >= upper_bound then
+                    youth_candidates[#youth_candidates + 1] = {
+                        index = i,
+                        potential = free_agent.potential
+                    }
+                end
+            end
+        end
+        
+        -- Sort by potential (highest first)
+        if #youth_candidates > 0 then
+            table.sort(youth_candidates, function(a, b) return a.potential > b.potential end)
+            return youth_candidates[1].index, true
+        end
     end
-    LOGGER:LogWarning(string.format("Player record for ID %d not found. Could not update preferred position.", player_id))
+    
+    -- If no youth with exact position, try alternatives
+    local alternatives = config.alternative_positions[position_required]
+    if not alternatives then return nil, false end
+    
+    -- Clear and repopulate candidates using alternatives
+    youth_candidates = {}
+    
+    for _, alt_position in ipairs(alternatives) do
+        if position_index and position_index[alt_position] then
+            for _, idx in ipairs(position_index[alt_position]) do
+                local free_agent = free_agents_list[idx]
+                if free_agent.age < max_age and free_agent.potential >= upper_bound then
+                    youth_candidates[#youth_candidates + 1] = {
+                        index = idx,
+                        potential = free_agent.potential,
+                        position = alt_position
+                    }
+                end
+            end
+        else
+            -- Fallback for each alternative
+            for i, free_agent in ipairs(free_agents_list) do
+                if free_agent.positionName == alt_position then
+                    local age = free_agent.age or calculate_player_age(player_data[free_agent.playerid].birthdate)
+                    if age < max_age and free_agent.potential >= upper_bound then
+                        youth_candidates[#youth_candidates + 1] = {
+                            index = i,
+                            potential = free_agent.potential,
+                            position = alt_position
+                        }
+                    end
+                end
+            end
+        end
+    end
+    
+    if #youth_candidates > 0 then
+        table.sort(youth_candidates, function(a, b) return a.potential > b.potential end)
+        return youth_candidates[1].index, true, youth_candidates[1].position
+    end
+    
+    return nil, false, nil
 end
 
-local function update_all_player_roles(player_id, new_role_id_1, new_role_id_2, new_role_id_3)
-    local players_table_record = players_table_global:GetFirstRecord()
-    while players_table_record > 0 do
-        local current_player_id = players_table_global:GetRecordFieldValue(players_table_record, "playerid")
-        if current_player_id == player_id then
-            local current_players_pos = players_table_global:GetRecordFieldValue(players_table_record, "preferredposition1")
-            -- if a gk set 3rd role as nothing
-            if current_players_pos == 0 then
-                new_role_id_3 = 0
-            end
-
-            players_table_global:SetRecordFieldValue(players_table_record, "role1", new_role_id_1)
-            players_table_global:SetRecordFieldValue(players_table_record, "role2", new_role_id_2)
-            players_table_global:SetRecordFieldValue(players_table_record, "role3", new_role_id_3)
-            LOGGER:LogInfo(string.format("Updated player %d's roles to %d,%d and %d.", player_id, new_role_id_1, new_role_id_2, new_role_id_3))
-            return
-        end
-        players_table_record = players_table_global:GetNextValidRecord()
-    end
-    LOGGER:LogWarning(string.format("Player record for ID %d not found. Could not update preferred position.", player_id))
-end
-
-local function handle_player_transfer(player_id, team_id, position, league_id, free_agents_list, candidate_index, used_alternative, alternative_position_used)
+local function handle_player_transfer(player_id, team_id, position, league_id, free_agents_list, candidate_index, used_alternative, alternative_position_used, is_youth_prospect)
     local player_name = GetPlayerName(player_id)
     local ok, error_message = pcall(function()
         if IsPlayerPresigned(player_id) then DeletePresignedContract(player_id) end
         if IsPlayerLoanedOut(player_id) then TerminateLoan(player_id) end
 
+        -- Find the player record once and reuse it
+        local player_rec, original_position_id = nil, -1
+        if used_alternative then
+            LOGGER:LogInfo(string.format("Used alternative position '%s' instead of '%s'.", alternative_position_used, position))
+            
+            -- Find player record once
+            local rec = players_table_global:GetFirstRecord()
+            while rec > 0 do
+                if players_table_global:GetRecordFieldValue(rec, "playerid") == player_id then
+                    player_rec = rec
+                    original_position_id = players_table_global:GetRecordFieldValue(rec, "preferredposition1")
+                    break
+                end
+                rec = players_table_global:GetNextValidRecord()
+            end
+            
+            if player_rec then
+                -- Convert to the new position
+                local new_pos_id = get_position_id_from_position_name(position)
+                players_table_global:SetRecordFieldValue(player_rec, "preferredposition1", new_pos_id)
+                
+                -- Update roles
+                local r1, r2, r3 = table.unpack(config.positions_to_roles[position] or {0, 0, 0})
+                if players_table_global:GetRecordFieldValue(player_rec, "preferredposition1") == 0 then r3 = 0 end
+                players_table_global:SetRecordFieldValue(player_rec, "role1", r1)
+                players_table_global:SetRecordFieldValue(player_rec, "role2", r2)
+                players_table_global:SetRecordFieldValue(player_rec, "role3", r3)
+                
+                LOGGER:LogInfo(string.format("Updated player %d pos1 to %d and roles to %d,%d,%d.", 
+                    player_id, new_pos_id, r1, r2, r3))
+                
+                -- Check if player's rating after conversion meets threshold
+                local lower_bound, _ = get_team_lower_upper_bounds(team_id, team_player_links_global, player_data, config.lower_bound_minus, config.upper_bound_plus)
+                local player_rating = players_table_global:GetRecordFieldValue(player_rec, "overallrating") 
+                              or players_table_global:GetRecordFieldValue(player_rec, "overall") or 0
+                
+                -- If player doesn't meet threshold, revert to original position
+                if player_rating < lower_bound then
+                    LOGGER:LogInfo(string.format("Player %s rating (%d) below threshold (%d) after position change. Reverting position.", 
+                        player_name, player_rating, lower_bound))
+                    
+                    -- Get original position name
+                    local original_position_name = get_position_name_from_position_id(original_position_id)
+                    
+                    -- Revert to original position
+                    if original_position_name and original_position_id > 0 then
+                        players_table_global:SetRecordFieldValue(player_rec, "preferredposition1", original_position_id)
+                        
+                        if config.positions_to_roles[original_position_name] then
+                            local roles = config.positions_to_roles[original_position_name]
+                            players_table_global:SetRecordFieldValue(player_rec, "role1", roles[1])
+                            players_table_global:SetRecordFieldValue(player_rec, "role2", roles[2])
+                            players_table_global:SetRecordFieldValue(player_rec, "role3", roles[3])
+                        end
+                    end
+                end
+            else
+                LOGGER:LogWarning(string.format("Player %d record not found. Could not update position.", player_id))
+            end
+        end
+
         TransferPlayer(player_id, team_id, config.transfer.sum, config.transfer.wage, config.transfer.contract_length, config.transfer.from_team_id, config.transfer.release_clause)
     end)
 
     if ok then
+        local transfer_type = "normal"
+        if used_alternative then
+            transfer_type = "alternative position"
+        elseif is_youth_prospect then
+            transfer_type = "youth prospect"
+        end
+        
         LOGGER:LogInfo(string.format(
-            "Transferred %s (%d) to team %s (%d) for position %s (league %d).",
-            player_name, player_id, GetTeamName(team_id), team_id, position, league_id
+            "Transferred %s (%d) to team %s (%d) for position %s as %s.",
+            player_name, player_id, GetTeamName(team_id), team_id, position, transfer_type
         ))
 
-        if used_alternative then
-            LOGGER:LogInfo(string.format("Used alternative position '%s' instead of '%s'.", alternative_position_used, position))
-            update_player_preferred_position_1(player_id, get_position_id_from_position_name(position))
-            update_all_player_roles(player_id, config.positions_to_roles[position][1], config.positions_to_roles[position][2], config.positions_to_roles[position][3])
-        end
-
+        -- Update caches after transfer
+        team_size_cache[team_id] = (team_size_cache[team_id] or 0) + 1
         table.remove(free_agents_list, candidate_index)
         return true
     else
@@ -469,80 +684,109 @@ local function handle_player_transfer(player_id, team_id, position, league_id, f
     end
 end
 
-local function find_alternative_candidate(free_agents_list, position_required)
-    local alternatives = config.alternative_positions[position_required]
-    if not alternatives then return nil, false, nil end
-
-    for _, alternative_position in ipairs(alternatives) do
-        local candidate_index = find_candidate(free_agents_list, alternative_position)
-        if candidate_index then
-            return candidate_index, true, alternative_position
-        end
-    end
-    return nil, false, nil
-end
-
-
-local function process_team_entry(entry, free_agents)
-    local team_id, position_required, league_id = entry.team_id, entry.position, entry.league_id
-
-    if get_team_size(team_id) >= config.squad_size then
+local function process_team_entry(entry, free_agents_list, position_index)
+    local team_id = entry.team_id
+    local req_pos = entry.position
+    
+    -- Check if team is already full
+    if get_team_size(team_id, team_player_links_global) >= config.squad_size then
         LOGGER:LogInfo(string.format("Team %d is full. Skipping.", team_id))
         return false
     end
 
-    local free_agents_list = free_agents[league_id]
-    local candidate_index = find_candidate(free_agents_list, position_required)
-    local used_alternative, alternative_position_used = false, nil
+    local lower_bound, upper_bound = get_team_lower_upper_bounds(team_id, team_player_links_global, player_data, config.lower_bound_minus, config.upper_bound_plus)
+    if not lower_bound or not upper_bound then
+        LOGGER:LogInfo(string.format("No rating stats for team %d; skipping %s.", team_id, req_pos))
+        return false
+    end
 
+    local candidate_index = find_candidate(free_agents_list, position_index, req_pos, lower_bound, upper_bound)
+    local used_alt, alt_position = false, nil
+    local is_youth_prospect = false
+    
     if not candidate_index then
-        candidate_index, used_alternative, alternative_position_used = find_alternative_candidate(free_agents_list, position_required)
+        candidate_index, used_alt, alt_position =
+            find_alternative_candidate(free_agents_list, position_index, req_pos, lower_bound, upper_bound)
+            
+        -- If still no candidate, try high potential youth
+        if not candidate_index then
+            candidate_index, is_youth_prospect, alt_position =
+                find_youth_potential_candidate(free_agents_list, position_index, req_pos, upper_bound)
+        end
     end
 
     if candidate_index then
         local player_id = free_agents_list[candidate_index].playerid
-        return handle_player_transfer(player_id, team_id, position_required, league_id, free_agents_list, candidate_index, used_alternative, alternative_position_used)
+        return handle_player_transfer(player_id, team_id, req_pos, nil,
+            free_agents_list, candidate_index, used_alt, alt_position, is_youth_prospect)
     else
         LOGGER:LogInfo(string.format(
-            "No free agent found for position '%s' or alternatives in league %d.",
-            position_required, league_id
+            "No suitable free agent found for team %d at position '%s' in [%d..%d]. Skipping.",
+            team_id, req_pos, lower_bound, upper_bound
         ))
         return false
     end
 end
 
 local function do_transfers()
-    local priority_queue = get_all_teams_and_needs()
-    if #priority_queue == 0 then
-        MessageBox("No Team Needs", "No teams found with missing positons. Done.")
+    -- Get all team needs
+    local queue = get_all_teams_and_needs()
+    if #queue == 0 then
+        MessageBox("No Team Needs", "No teams found with missing positions.")
         return
     end
 
-    local free_agents = build_free_agents_for_leagues()
+    -- Build free agents list with position indexing
+    local free_agents_list, position_index = build_free_agents()
+    if #free_agents_list == 0 then
+        MessageBox("No Free Agents", "No eligible free agents found to transfer.")
+        return
+    end
+    
     if not players_table_global then
-        LOGGER:LogError("Players table not initialized. Aborting transfers.")
+        LOGGER:LogError("Players table not initialized. Aborting.")
         return
     end
 
+    -- Process all team needs
     local total_transfers = 0
-
-    for _, team_entry in ipairs(priority_queue) do
-        local transfer_successful = process_team_entry(team_entry, free_agents)
-        if transfer_successful then
-            total_transfers = total_transfers + 1
+    local start_time = os.time()
+    
+    for idx, team_entry in ipairs(queue) do
+        -- Provide periodic updates for long-running operations
+        if idx % 100 == 0 then
+            local elapsed = os.time() - start_time
+            LOGGER:LogInfo(string.format("Processed %d/%d needs (%d%%) in %d seconds. Transfers so far: %d", 
+                idx, #queue, math.floor(idx / #queue * 100), elapsed, total_transfers))
+        end
+        
+        local success = process_team_entry(team_entry, free_agents_list, position_index)
+        if success then 
+            total_transfers = total_transfers + 1 
+            
+            -- Update position index after each successful transfer
+            -- (removes the transferred player from all indices)
+            position_index = {}
+            for i, player in ipairs(free_agents_list) do
+                local pos = player.positionName
+                if pos then
+                    position_index[pos] = position_index[pos] or {}
+                    table.insert(position_index[pos], i)
+                end
+            end
         end
     end
 
+    local elapsed = os.time() - start_time
     MessageBox("Transfers Done", string.format(
-        "Processed %d needs in priority queue. Total successful transfers: %d",
-        #priority_queue, total_transfers
+        "Processed %d needs in %d seconds.\nTotal successful transfers: %d", 
+        #queue, elapsed, total_transfers
     ))
 end
 
 --------------------------------------------------------------------------------
 -- MAIN SCRIPT
 --------------------------------------------------------------------------------
-
 math.randomseed(os.time())
 LOGGER:LogInfo("Starting Multi-League Transfer Script...")
 
