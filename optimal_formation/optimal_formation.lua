@@ -37,10 +37,10 @@ local position_config = {
     alternative_positions = {
         RB = {"LB"}, 
         LB = {"RB"},
-        RM = {"LM", "RW"}, 
-        LM = {"RM", "LW"},
-        RW = {"LW", "RM"}, 
-        LW = {"RW", "LM"}
+        RM = {"LM", "RW", "LW"}, 
+        LM = {"RM", "LW", "RW"},
+        RW = {"LW", "RM", "LM"}, 
+        LW = {"RW", "RM", "LM"}
     }
 }
 
