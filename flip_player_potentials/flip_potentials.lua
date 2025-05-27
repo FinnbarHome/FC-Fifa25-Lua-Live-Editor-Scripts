@@ -1,7 +1,7 @@
 -- FLIP-BASED POTENTIAL SCRIPT
--- Pairs up players of the same age and flips their potential values, 
--- respecting the condition that flipped potentials remain >= current overall.
-
+-- Pairs up players of similar age ranges and fully swaps their potential values, 
+-- respecting the condition that potentials remain >= current overall.
+-- Improved for FC 25 Live Editor with better pairing algorithm and configurable options.
 
 require 'imports/other/helpers'
 require 'imports/career_mode/helpers'
@@ -9,6 +9,28 @@ require 'imports/career_mode/helpers'
 ------------------------------------------------------------------------------
 -- 1) CONFIG
 ------------------------------------------------------------------------------
+
+-- User configurable options
+local CONFIG = {
+    -- Which age ranges to include in the flip (true = include, false = skip)
+    includeRanges = {
+        ["16-18"] = true,
+        ["19-21"] = true,
+        ["22-25"] = true,
+        ["26-28"] = true,
+        ["29-31"] = true,
+        ["32+"] = true,
+    },
+    
+    -- Smart pairing to maximize successful flips (vs pure random pairing)
+    useSmartPairing = true,
+    
+    -- Maximum attempts to find valid pairs for each player (higher = more success but slower)
+    maxPairingAttempts = 10,
+    
+    -- Enable detailed logging
+    detailedLogging = false,
+}
 
 -- Age ranges for final stats:
 -- { minAge, maxAge, label }
@@ -31,6 +53,9 @@ local upSum   = {}
 local upCount = {}
 local downSum = {}
 local downCount = {}
+local skipCount = {}
+local totalPlayersProcessed = 0
+local failedPairings = 0
 
 -- Init for each range
 for _, r in ipairs(AGE_RANGES) do
@@ -39,6 +64,7 @@ for _, r in ipairs(AGE_RANGES) do
     upCount[lbl] = 0
     downSum[lbl] = 0
     downCount[lbl] = 0
+    skipCount[lbl] = 0
 end
 
 -- Maps an age to a range label.
@@ -74,7 +100,7 @@ local function GetAge(birthdate)
 end
 
 ------------------------------------------------------------------------------
--- 4) GROUP PLAYERS BY AGE
+-- 4) GROUP PLAYERS BY RANGE
 ------------------------------------------------------------------------------
 
 local players_table = LE.db:GetTable("players")
@@ -83,132 +109,297 @@ if not players_table then
     return
 end
 
--- ageGroups[age] = list of { recordIndex, playerid, overall, potential, rangeKey }
-local ageGroups = {}
+-- rangeGroups[rangeKey] = list of { recordIndex, playerid, overall, potential, age }
+local rangeGroups = {}
+
+local function LogDebug(msg)
+    if CONFIG.detailedLogging then
+        LOGGER:LogInfo(msg)
+    end
+end
+
+-- Initialize range groups
+for _, r in ipairs(AGE_RANGES) do
+    rangeGroups[r[3]] = {}
+end
 
 local rec = players_table:GetFirstRecord()
 while rec > 0 do
     local pid = players_table:GetRecordFieldValue(rec, "playerid")
-
+    
     local ov = players_table:GetRecordFieldValue(rec, "overallrating")
     if not ov or ov == 0 then
         local alt = players_table:GetRecordFieldValue(rec, "overall")
         ov = (alt and alt > 0) and alt or 50
     end
-
+    
     local pot = players_table:GetRecordFieldValue(rec, "potential") or 50
-
+    
     local bd = players_table:GetRecordFieldValue(rec, "birthdate")
     local age = GetAge(bd)
     local rKey = GetRangeKey(age)
-
-    if not ageGroups[age] then
-        ageGroups[age] = {}
+    
+    -- Only add if we're processing this range
+    if CONFIG.includeRanges[rKey] then
+        table.insert(rangeGroups[rKey], {
+            recordIndex = rec,
+            playerid    = pid,
+            overall     = ov,
+            potential   = pot,
+            age         = age,
+            rangeKey    = rKey 
+        })
+        totalPlayersProcessed = totalPlayersProcessed + 1
     end
-
-    table.insert(ageGroups[age], {
-        recordIndex = rec,
-        playerid    = pid,
-        overall     = ov,
-        potential   = pot,
-        rangeKey    = rKey
-    })
-
+    
     rec = players_table:GetNextValidRecord()
 end
 
 ------------------------------------------------------------------------------
--- 5) FLIP POTENTIAL PER AGE GROUP
+-- 5) IMPROVED FLIP POTENTIAL ALGORITHM
 ------------------------------------------------------------------------------
 
 local totalFlips = 0
 
-for age, plist in pairs(ageGroups) do
-    -- Shuffle
-    for i = #plist, 2, -1 do
-        local j = math.random(i)
-        plist[i], plist[j] = plist[j], plist[i]
+local function CanSwapPotentials(p1, p2)
+    -- Only check that the potential >= overall after swap
+    return p2.potential >= p1.overall and p1.potential >= p2.overall
+end
+
+local function DoSwapPotentials(p1, p2)
+    -- Get current values
+    local potA = p1.potential
+    local potB = p2.potential
+    
+    -- Safety check
+    if potB < p1.overall or potA < p2.overall then
+        LogDebug(string.format("Invalid swap - Player %d pot: %d -> %d (ovr: %d), Player %d pot: %d -> %d (ovr: %d)",
+            p1.playerid, potA, potB, p1.overall, p2.playerid, potB, potA, p2.overall))
+        return false
     end
+    
+    -- Flip in DB
+    players_table:SetRecordFieldValue(p1.recordIndex, "potential", potB)
+    players_table:SetRecordFieldValue(p2.recordIndex, "potential", potA)
+    
+    -- Calculate deltas
+    local dA = potB - potA
+    local dB = potA - potB
+    
+    -- Update up/down stats
+    if dA > 0 then
+        upSum[p1.rangeKey]   = upSum[p1.rangeKey] + dA
+        upCount[p1.rangeKey] = upCount[p1.rangeKey] + 1
+    elseif dA < 0 then
+        local absD = math.abs(dA)
+        downSum[p1.rangeKey]   = downSum[p1.rangeKey] + absD
+        downCount[p1.rangeKey] = downCount[p1.rangeKey] + 1
+    end
+    
+    if dB > 0 then
+        upSum[p2.rangeKey]   = upSum[p2.rangeKey] + dB
+        upCount[p2.rangeKey] = upCount[p2.rangeKey] + 1
+    elseif dB < 0 then
+        local absD = math.abs(dB)
+        downSum[p2.rangeKey]   = downSum[p2.rangeKey] + absD
+        downCount[p2.rangeKey] = downCount[p2.rangeKey] + 1
+    end
+    
+    -- Update local values for accurate tracking
+    p1.potential = potB
+    p2.potential = potA
+    
+    LogDebug(string.format("Swapped - Player %d: %d -> %d, Player %d: %d -> %d", 
+        p1.playerid, potA, potB, p2.playerid, potB, potA))
+        
+    return true
+end
 
-    -- Pair up: (1,2), (3,4), ...
-    local i = 1
-    while i < #plist do
-        local p1 = plist[i]
-        local p2 = plist[i+1]
-        i = i + 2
-
-        local potA = p1.potential
-        local potB = p2.potential
-        local ovA  = p1.overall
-        local ovB  = p2.overall
-
-        local newPotA = potB
-        local newPotB = potA
-
-        -- Check validity
-        if newPotA >= ovA and newPotB >= ovB then
-            -- Flip in DB
-            players_table:SetRecordFieldValue(p1.recordIndex, "potential", newPotA)
-            players_table:SetRecordFieldValue(p2.recordIndex, "potential", newPotB)
-            totalFlips = totalFlips + 1
-
-            -- Calculate deltas
-            local dA = newPotA - potA
-            local dB = newPotB - potB
-
-            -- Update up/down stats
-            if dA > 0 then
-                upSum[p1.rangeKey]   = upSum[p1.rangeKey] + dA
-                upCount[p1.rangeKey] = upCount[p1.rangeKey] + 1
-            elseif dA < 0 then
-                local absD = math.abs(dA)
-                downSum[p1.rangeKey]   = downSum[p1.rangeKey] + absD
-                downCount[p1.rangeKey] = downCount[p1.rangeKey] + 1
-            end
-
-            if dB > 0 then
-                upSum[p2.rangeKey]   = upSum[p2.rangeKey] + dB
-                upCount[p2.rangeKey] = upCount[p2.rangeKey] + 1
-            elseif dB < 0 then
-                local absD = math.abs(dB)
-                downSum[p2.rangeKey]   = downSum[p2.rangeKey] + absD
-                downCount[p2.rangeKey] = downCount[p2.rangeKey] + 1
-            end
-
-            -- Update local values
-            p1.potential = newPotA
-            p2.potential = newPotB
+-- Process each age range
+for _, rangeData in ipairs(AGE_RANGES) do
+    local rangeKey = rangeData[3]
+    
+    -- Skip if range is disabled in config
+    if not CONFIG.includeRanges[rangeKey] then
+        LogDebug("Skipping range: " .. rangeKey)
+        goto continue
+    end
+    
+    local players = rangeGroups[rangeKey]
+    
+    if #players < 2 then
+        LogDebug("Not enough players in range: " .. rangeKey)
+        goto continue
+    end
+    
+    LogDebug(string.format("Processing %d players in range %s", #players, rangeKey))
+    
+    -- Thoroughly shuffle the players for maximum randomization
+    for i = 1, 3 do  -- Multiple shuffle passes for better randomization
+        for j = #players, 2, -1 do
+            local k = math.random(j)
+            players[j], players[k] = players[k], players[j]
         end
     end
+    
+    -- Track which players have been processed
+    local processed = {}
+    for i = 1, #players do
+        processed[i] = false
+    end
+    
+    if CONFIG.useSmartPairing then
+        -- Smart pairing algorithm
+        for i = 1, #players do
+            if not processed[i] then
+                local p1 = players[i]
+                local candidates = {}
+                
+                -- Find all valid candidates first
+                for j = 1, #players do
+                    if not processed[j] and j ~= i then
+                        local p2 = players[j]
+                        
+                        if CanSwapPotentials(p1, p2) then
+                            table.insert(candidates, j)
+                        end
+                    end
+                end
+                
+                -- If we have candidates, pick one randomly
+                if #candidates > 0 then
+                    local randomIdx = math.random(#candidates)
+                    local bestPairIndex = candidates[randomIdx]
+                    
+                    if DoSwapPotentials(p1, players[bestPairIndex]) then
+                        totalFlips = totalFlips + 1
+                        processed[i] = true
+                        processed[bestPairIndex] = true
+                    end
+                else
+                    -- Could not find a valid pair for this player
+                    skipCount[rangeKey] = skipCount[rangeKey] + 1
+                    processed[i] = true
+                    failedPairings = failedPairings + 1
+                end
+            end
+        end
+        
+        -- Second pass to catch any unprocessed players
+        if failedPairings > 0 then
+            local unprocessed = {}
+            for i = 1, #players do
+                if not processed[i] then
+                    table.insert(unprocessed, i)
+                end
+            end
+            
+            -- If we have an even number of unprocessed players, try to pair them
+            if #unprocessed >= 2 then
+                -- Shuffle the unprocessed list
+                for i = #unprocessed, 2, -1 do
+                    local j = math.random(i)
+                    unprocessed[i], unprocessed[j] = unprocessed[j], unprocessed[i]
+                end
+                
+                -- Attempt to pair them
+                for i = 1, #unprocessed, 2 do
+                    if i + 1 <= #unprocessed then
+                        local p1 = players[unprocessed[i]]
+                        local p2 = players[unprocessed[i+1]]
+                        
+                        p1.rangeKey = rangeKey
+                        p2.rangeKey = rangeKey
+                        
+                        if CanSwapPotentials(p1, p2) then
+                            if DoSwapPotentials(p1, p2) then
+                                totalFlips = totalFlips + 1
+                                processed[unprocessed[i]] = true
+                                processed[unprocessed[i+1]] = true
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    else
+        local i = 1
+        while i < #players do
+            local p1 = players[i]
+            local p2 = players[i+1]
+            
+            -- Ensure rangeKey is set
+            p1.rangeKey = rangeKey
+            p2.rangeKey = rangeKey
+            
+            if CanSwapPotentials(p1, p2) then
+                if DoSwapPotentials(p1, p2) then
+                    totalFlips = totalFlips + 1
+                end
+            else
+                skipCount[rangeKey] = skipCount[rangeKey] + 2
+                failedPairings = failedPairings + 1
+            end
+            
+            i = i + 2
+        end
+        
+        -- Handle odd number of players
+        if #players % 2 == 1 then
+            skipCount[rangeKey] = skipCount[rangeKey] + 1
+        end
+    end
+    
+    ::continue::
 end
 
 ------------------------------------------------------------------------------
--- 6) STATS OUTPUT
+-- 6) ENHANCED STATS OUTPUT
 ------------------------------------------------------------------------------
 
 local lines = {}
-table.insert(lines, string.format("Flip-based script done. Flips: %d", totalFlips))
+table.insert(lines, string.format("FC 25 Potential Flip Script Complete"))
+table.insert(lines, string.format("Total players processed: %d", totalPlayersProcessed))
+table.insert(lines, string.format("Successful potential flips: %d", totalFlips))
+table.insert(lines, string.format("Failed pairings: %d", failedPairings))
 table.insert(lines, "")
-table.insert(lines, "Avg potential UP & DOWN by age range:")
+table.insert(lines, "Stats by age range:")
 
 for _, rr in ipairs(AGE_RANGES) do
     local lbl = rr[3]
+    
+    -- Skip disabled ranges in output
+    if not CONFIG.includeRanges[lbl] then
+        table.insert(lines, string.format("  %s -> DISABLED", lbl))
+        goto nextRange
+    end
+    
+    local totalInRange = #rangeGroups[lbl]
+    local skipped = skipCount[lbl]
+    
     local au, cu = 0, upCount[lbl]
     if cu > 0 then
         au = upSum[lbl] / cu
     end
-
+    
     local ad, cd = 0, downCount[lbl]
     if cd > 0 then
         ad = downSum[lbl] / cd
     end
-
+    
+    local successRate = 0
+    if totalInRange > 0 then
+        successRate = ((totalInRange - skipped) / totalInRange) * 100
+    end
+    
     table.insert(lines, string.format(
-        "  %s -> flipsUp=%d (avgUp=%.2f), flipsDown=%d (avgDown=%.2f)",
-        lbl, cu, au, cd, ad
+        "  %s -> Success: %.1f%% (%d/%d players) | Avg changes: +%.1f (×%d), -%.1f (×%d)",
+        lbl, successRate, (totalInRange - skipped), totalInRange, au, cu, ad, cd
     ))
+    
+    ::nextRange::
 end
 
 local finalMsg = table.concat(lines, "\n")
 LOGGER:LogInfo(finalMsg)
-MessageBox("Done", finalMsg)
+MessageBox("FC 25 Potential Flip", finalMsg)
