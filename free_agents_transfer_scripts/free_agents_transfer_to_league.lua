@@ -47,7 +47,7 @@ local config = {
         RW = {35, 36, 37}, -- Eg: 35,36,37 Winger, Inside Forward, Wide Playmaker
         LW = {38, 39, 40} -- Eg: 38,39,40 Winger, Inside Forward, Wide Playmaker
     },
-    age_constraints = {min = 16, max = 35},
+    age_constraints = {min = 16, max = 32},
     squad_size = 52,
     target_leagues = {61,60,14,13,16,17,19,20,2076,31,32,10,83,53,54,353,351,80,4,2012,1,2149,41,66,308,65,330,350,50,56,189,68,39}, -- Eg: 61 = EFL League Two, 60 = EFL League One, 14 = EFL Championship, premier league, lig 1, lig 2, Bund, bund 2, bund 3, erd, k league, Liga 1, liga 2, argentinan prem, A league, O.Bund, 1A pro l, CSL, 3F Sup L, ISL, Eliteserien, PKO BP Eks, liga port, SSE Airtricity, Superliga, Saudi L, Scot prem, Allsven, CSSL, super lig, MLS
     excluded_teams = { [110] = true },         -- e.g. { [1234] = true }
@@ -58,8 +58,8 @@ local config = {
         release_clause = -1,
         from_team_id = 111592
     },
-    lower_bound_minus = 2, -- This is the range that the script subtracts from the lower bounds of the team's ratings.
-    upper_bound_plus = 2 -- This is the range that the script adds to the upper bounds of the team's ratings.
+    lower_bound_minus = 1, -- This is the range that the script subtracts from the lower bounds of the team's ratings.
+    upper_bound_plus = 3 -- This is the range that the script adds to the upper bounds of the team's ratings.
 }
 
 -- Pre-compute position mappings for faster lookups

@@ -40,11 +40,11 @@ local config = {
     -- Youth development settings
     protect_youth = true,             -- Set to false to disable youth protection
     youth_max_age = 23,               -- Maximum age to be considered a youth player
-    youth_potential_bonus = 2,        -- How many points above median team rating the potential must be
+    youth_potential_bonus = 3,        -- How many points above median team rating the potential must be
     youth_max_protected_per_pos = 1,  -- Maximum number of youth players to protect per position
     
     -- Performance settings
-    batch_size = 10,                  -- Number of teams to process before saving progress
+    batch_size = 20,                  -- Number of teams to process before saving progress
     
     -- Process control
     convert_non_formation_players = true,  -- Try to convert players not in formation to alternative positions
