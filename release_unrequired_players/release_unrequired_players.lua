@@ -18,7 +18,7 @@ local playerloans_table_global = LE.db:GetTable("playerloans")
 --------------------------------------------------------------------------------
 local config = {
     target_leagues = {61,60,14,13,16,17,19,20,2076,31,32,10,83,53,54,353,351,80,4,2012,1,2149,41,66,308,65,330,350,50,56,189,68,39}, -- Eg: 61 = EFL League Two, 60 = EFL League One, 14 = EFL Championship, premier league, lig 1, lig 2, Bund, bund 2, bund 3, erd, k league, Liga 1, liga 2, argentinan prem, A league, O.Bund, 1A pro l, CSL, 3F Sup L, ISL, Eliteserien, PKO BP Eks, liga port, SSE Airtricity, Superliga, Saudi L, Scot prem, Allsven, CSSL, super lig, MLS
-    excluded_teams = { [110] = true },         -- e.g. { [1234] = true }
+    excluded_teams = { [115486] = true },         -- e.g. { [1234] = true }
 
     alternative_positions = {
         RW = {"RM"},
@@ -574,40 +574,45 @@ local function process_team(team_id)
                     local regular_slots = math.floor(max_for_pos * 2/3)
                     local youth_eligible_slots = max_for_pos - regular_slots
                     
-                    -- Identify potential high-potential youth in the lower 2/3 of the array
-                    local youth_candidates = {}
-                    for i = regular_slots + 1, #arr do
+                    -- First identify ALL high potential youth players
+                    local all_youth_candidates = {}
+                    for i = 1, #arr do
                         if is_high_potential_youth(arr[i], team_median) then
-                            table.insert(youth_candidates, {
+                            table.insert(all_youth_candidates, {
                                 player = arr[i],
-                                index = i
+                                index = i,
+                                is_in_top_overall = i <= regular_slots
                             })
                         end
                     end
                     
-                    -- Sort youth candidates by potential (descending)
-                    table.sort(youth_candidates, function(a, b)
+                    -- Sort ALL youth candidates by potential (descending)
+                    table.sort(all_youth_candidates, function(a, b)
                         return a.player.potential > b.player.potential
                     end)
                     
                     -- Track which players to keep
                     local players_to_keep = {}
+                    
+                    -- First add all top overall players
                     for i = 1, regular_slots do
                         players_to_keep[arr[i].id] = true
                     end
                     
-                    -- Add high potential youth up to the limit
+                    -- Then add highest potential youth players up to the limit
+                    -- but only if they're not already in the top overall slots
                     local youth_added = 0
-                    for i = 1, math.min(youth_eligible_slots, #youth_candidates) do
-                        local candidate = youth_candidates[i]
-                        players_to_keep[candidate.player.id] = true
-                        youth_added = youth_added + 1
-                        
-                        LOGGER:LogInfo(string.format(
-                            "Protected youth player %d (OVR: %d, POT: %d, Age: %d) in position %s",
-                            candidate.player.id, candidate.player.overall, 
-                            candidate.player.potential, candidate.player.age, posName
-                        ))
+                    for _, candidate in ipairs(all_youth_candidates) do
+                        if not candidate.is_in_top_overall and youth_added < youth_eligible_slots then
+                            players_to_keep[candidate.player.id] = true
+                            youth_added = youth_added + 1
+                            
+                            LOGGER:LogInfo(string.format(
+                                "Protected youth player %d (OVR: %d, POT: %d, Age: %d) in position %s",
+                                candidate.player.id, candidate.player.overall, 
+                                candidate.player.potential, candidate.player.age, posName
+                            ))
+                        end
                     end
                     
                     -- Fill remaining slots with next highest overall players

@@ -19,7 +19,7 @@ local playerloans_table_global = LE.db:GetTable("playerloans")
 local config = {
     -- Target leagues to process
     target_leagues = {61,60,14,13,16,17,19,20,2076,31,32,10,83,53,54,353,351,80,4,2012,1,2149,41,66,308,65,330,350,50,56,189,68,39},
-    excluded_teams = { [110] = true },
+    excluded_teams = { [115486] = true },
     
     -- Upgrade thresholds
     median_minus_threshold = 0,  -- If best player in position is median-3 or lower, try to upgrade
@@ -258,7 +258,7 @@ local function calculate_team_median_rating(team_id)
     median = math.floor(median + 0.5)
     team_median_ratings[team_id] = median
     
-    LOGGER:LogInfo(string.format("Team %d median rating calculated: %d", team_id, median))
+    -- LOGGER:LogInfo(string.format("Team %d median rating calculated: %d", team_id, median))
     return median
 end
 
@@ -634,6 +634,54 @@ local function build_team_pool()
 end
 
 --------------------------------------------------------------------------------
+-- UPGRADE PRIORITY CALCULATION
+--------------------------------------------------------------------------------
+local function calculate_team_upgrade_priorities(team_id)
+    local priorities = {}
+    local team_median = calculate_team_median_rating(team_id)
+    local formation_positions = get_formation_positions(team_id)
+    
+    -- Get unique positions from formation
+    local unique_positions = {}
+    for _, pos in ipairs(formation_positions) do
+        unique_positions[pos] = true
+    end
+    
+    -- Calculate priority for each position
+    for position in pairs(unique_positions) do
+        local players_list = get_team_players(team_id)
+        local position_players = {}
+        
+        for _, player in ipairs(players_list) do
+            if player.posName == position then
+                table.insert(position_players, player)
+            end
+        end
+        
+        if #position_players > 0 then
+            -- Find best player in position
+            table.sort(position_players, function(a, b) return a.overall > b.overall end)
+            local best_player = position_players[1]
+            local upgrade_threshold = team_median - config.median_minus_threshold
+            
+            if best_player.overall <= upgrade_threshold then
+                -- Calculate priority based on how far below threshold the best player is
+                local priority = upgrade_threshold - best_player.overall
+                table.insert(priorities, {
+                    team_id = team_id,
+                    position = position,
+                    priority = priority,
+                    best_player_rating = best_player.overall,
+                    team_median = team_median
+                })
+            end
+        end
+    end
+    
+    return priorities
+end
+
+--------------------------------------------------------------------------------
 -- MAIN FUNCTION
 --------------------------------------------------------------------------------
 local function do_team_upgrades()
@@ -655,37 +703,67 @@ local function do_team_upgrades()
         #team_pool, table.concat(config.target_leagues, ", ")
     ))
     
+    -- Calculate all upgrade priorities
+    LOGGER:LogInfo("Calculating upgrade priorities for all teams...")
+    local all_priorities = {}
+    for _, team_id in ipairs(team_pool) do
+        local team_priorities = calculate_team_upgrade_priorities(team_id)
+        for _, priority in ipairs(team_priorities) do
+            table.insert(all_priorities, priority)
+        end
+    end
+    
+    -- Sort priorities by highest priority (biggest gap) first
+    table.sort(all_priorities, function(a, b) return a.priority > b.priority end)
+    
+    LOGGER:LogInfo(string.format("Found %d positions needing upgrades across all teams", #all_priorities))
+    
     local total_upgrades = 0
     local total_releases = 0
     local success_count = 0
     local error_count = 0
+    local processed_teams = {}
     
-    -- Process each team
-    for idx, team_id in ipairs(team_pool) do
-        if idx % 5 == 0 or idx == 1 or idx == #team_pool then
-            local percent_complete = math.floor(idx / #team_pool * 100)
+    -- Process each priority
+    for idx, priority in ipairs(all_priorities) do
+        if idx % 5 == 0 or idx == 1 or idx == #all_priorities then
+            local percent_complete = math.floor(idx / #all_priorities * 100)
             LOGGER:LogInfo(string.format(
-                "Progress: %d/%d teams (%d%%) - %d upgrades, %d releases so far", 
-                idx, #team_pool, percent_complete, total_upgrades, total_releases
+                "Progress: %d/%d priorities (%d%%) - %d upgrades, %d releases so far", 
+                idx, #all_priorities, percent_complete, total_upgrades, total_releases
             ))
         end
         
+        -- Skip if we've already processed this team
+        if processed_teams[priority.team_id] then
+            goto continue
+        end
+        
+        LOGGER:LogInfo(string.format(
+            "Processing team %d (ID: %d) - Position %s needs upgrade (Best: %d, Median: %d, Priority: %d)",
+            idx, priority.team_id, priority.position, priority.best_player_rating, 
+            priority.team_median, priority.priority
+        ))
+        
         local success, err = pcall(function()
-            local upgrades, releases = process_team_upgrades(team_id)
+            local upgrades, releases = process_team_upgrades(priority.team_id)
             total_upgrades = total_upgrades + upgrades
             total_releases = total_releases + releases
             success_count = success_count + 1
+            processed_teams[priority.team_id] = true
         end)
         
         if not success then
             error_count = error_count + 1
-            LOGGER:LogError(string.format("Error processing team %d: %s", team_id, tostring(err)))
+            LOGGER:LogError(string.format("Error processing team %d: %s", priority.team_id, tostring(err)))
         end
         
         -- Save progress periodically
         if idx % config.batch_size == 0 then
             LOGGER:LogInfo("Batch complete. Saving progress...")
         end
+        
+        ::continue::
     end
     
     local total_elapsed = os.time() - start_time

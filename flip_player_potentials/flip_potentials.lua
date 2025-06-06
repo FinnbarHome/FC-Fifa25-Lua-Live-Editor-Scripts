@@ -14,13 +14,17 @@ require 'imports/career_mode/helpers'
 local CONFIG = {
     -- Which age ranges to include in the flip (true = include, false = skip)
     includeRanges = {
-        ["16-18"] = true,
-        ["19-21"] = true,
+        ["16-17"] = true,
+        ["18-19"] = true,
+        ["20-21"] = true,
         ["22-25"] = true,
         ["26-28"] = true,
         ["29-31"] = true,
         ["32+"] = true,
     },
+    
+    -- Teams to exclude from potential flips (e.g. { [1234] = true })
+    excluded_teams = { [110] = true },
     
     -- Smart pairing to maximize successful flips (vs pure random pairing)
     useSmartPairing = true,
@@ -35,8 +39,9 @@ local CONFIG = {
 -- Age ranges for final stats:
 -- { minAge, maxAge, label }
 local AGE_RANGES = {
-    {16, 18, "16-18"},
-    {19, 21, "19-21"},
+    {16, 17, "16-17"},
+    {18, 19, "18-19"},
+    {20, 21, "20-21"},
     {22, 25, "22-25"},
     {26, 28, "26-28"},
     {29, 31, "29-31"},
@@ -104,10 +109,25 @@ end
 ------------------------------------------------------------------------------
 
 local players_table = LE.db:GetTable("players")
+local team_player_links = LE.db:GetTable("teamplayerlinks")
 if not players_table then
     MessageBox("Error", "No 'players' table.")
     return
 end
+
+-- Build team index first for faster lookups
+LOGGER:LogInfo("Building team index...")
+local player_team_map = {}
+local rec = team_player_links:GetFirstRecord()
+while rec > 0 do
+    local pid = team_player_links:GetRecordFieldValue(rec, "playerid")
+    local tid = team_player_links:GetRecordFieldValue(rec, "teamid")
+    if pid and tid then
+        player_team_map[pid] = tid
+    end
+    rec = team_player_links:GetNextValidRecord()
+end
+LOGGER:LogInfo("Team index built successfully")
 
 -- rangeGroups[rangeKey] = list of { recordIndex, playerid, overall, potential, age }
 local rangeGroups = {}
@@ -123,9 +143,23 @@ for _, r in ipairs(AGE_RANGES) do
     rangeGroups[r[3]] = {}
 end
 
+-- Process players in batches for better performance
+local BATCH_SIZE = 1000
+local processed = 0
+local skipped = 0
+
+LOGGER:LogInfo("Processing players...")
 local rec = players_table:GetFirstRecord()
 while rec > 0 do
     local pid = players_table:GetRecordFieldValue(rec, "playerid")
+    
+    -- Skip players from excluded teams using the index
+    local team_id = player_team_map[pid]
+    if team_id and CONFIG.excluded_teams[team_id] then
+        skipped = skipped + 1
+        rec = players_table:GetNextValidRecord()
+        goto continue
+    end
     
     local ov = players_table:GetRecordFieldValue(rec, "overallrating")
     if not ov or ov == 0 then
@@ -152,8 +186,16 @@ while rec > 0 do
         totalPlayersProcessed = totalPlayersProcessed + 1
     end
     
+    processed = processed + 1
+    if processed % BATCH_SIZE == 0 then
+        LOGGER:LogInfo(string.format("Processed %d players (%d skipped)...", processed, skipped))
+    end
+    
     rec = players_table:GetNextValidRecord()
+    ::continue::
 end
+
+LOGGER:LogInfo(string.format("Finished processing %d players (%d skipped)", processed, skipped))
 
 ------------------------------------------------------------------------------
 -- 5) IMPROVED FLIP POTENTIAL ALGORITHM
