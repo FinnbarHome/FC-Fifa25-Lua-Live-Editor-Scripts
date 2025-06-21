@@ -19,7 +19,7 @@ local playerloans_table_global = LE.db:GetTable("playerloans")
 local config = {
     -- Target leagues to process
     target_leagues = {61,60,14,13,16,17,19,20,2076,31,32,10,83,53,54,353,351,80,4,2012,1,2149,41,66,308,65,330,350,50,56,189,68,39},
-    excluded_teams = { [115486] = true },
+    excluded_teams = { [110] = true },
     
     -- Upgrade thresholds
     median_minus_threshold = 0,  -- If best player in position is median-3 or lower, try to upgrade

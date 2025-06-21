@@ -18,6 +18,10 @@ local MAX_CURRENT_OVERALL = 65
 -- Only affect players whose current potential ≤ this rating
 local MAX_CURRENT_POTENTIAL = 70  -- e.g., ignore players who already have 81+ potential
 
+-- NEW: Nationality filter
+local ENABLE_NATIONALITY_FILTER = false  -- Set to true to enable nationality filtering
+local TARGET_NATIONALITY = 14           -- Set to the desired nationality int (e.g., 14 for Brazil)
+
 ------------------------------------------------------------------------------
 -- 2) HELPER: GetAge(birthdate)
 ------------------------------------------------------------------------------
@@ -72,11 +76,19 @@ while current_record > 0 do
     local birthdate = players_table:GetRecordFieldValue(current_record, "birthdate")
     local age       = GetAge(birthdate)
 
+    -- NEW: Get nationality
+    local nationality = players_table:GetRecordFieldValue(current_record, "nationality")
+
     -- Criteria:
     -- 1) Age ≤ 19
     -- 2) Overall ≤ MAX_CURRENT_OVERALL
     -- 3) Potential ≤ MAX_CURRENT_POTENTIAL
-    if age <= 19 and overall <= MAX_CURRENT_OVERALL and potential <= MAX_CURRENT_POTENTIAL then
+    -- 4) (Optional) Nationality == TARGET_NATIONALITY if enabled
+    local isEligible = age <= 19 and overall <= MAX_CURRENT_OVERALL and potential <= MAX_CURRENT_POTENTIAL
+    if ENABLE_NATIONALITY_FILTER then
+        isEligible = isEligible and (nationality == TARGET_NATIONALITY)
+    end
+    if isEligible then
         table.insert(eligiblePlayers, {
             recordIndex = current_record,
             playerid    = playerid
