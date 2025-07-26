@@ -1,6 +1,13 @@
 --------------------------------------------------------------------------------
 -- Simplified Squad Filler Script for FC 25 Live Editor
--- Transfers players to teams with smallest squad sizes
+-- 
+-- Modular system for transferring players to teams with smallest squad sizes
+-- Features:
+--   • Strategic position group balancing (GK:DEF:MID:AM:ST ratios)
+--   • Formation-aware player selection
+--   • Youth player development pathway
+--   • Comprehensive caching for performance
+--   • Extensible search strategy system
 --------------------------------------------------------------------------------
 require 'imports/career_mode/helpers'
 require 'imports/other/helpers'
@@ -13,74 +20,76 @@ local formations_table_global = LE.db:GetTable("formations")
 --------------------------------------------------------------------------------
 -- CONFIGURATION
 --------------------------------------------------------------------------------
-local config = {
-    positions_to_roles = {
-        GK = {1, 2, 0}, -- Goalkeeper, Sweeperkeeper, None
-        CB = {11, 12, 13}, -- Defender, Stopper, Ball-playing Defender
-        RB = {3, 4, 5}, -- Fullback, Falseback, Wingback
-        LB = {7, 8, 9}, -- Fullback, Falseback, Wingback
-        CDM = {14, 15, 16}, -- Holding, Centre-half, Deep-lying Playmaker
-        RM = {23, 24, 26}, -- Winger, Wide Midfielder, Inside Forward
-        CM = {18, 19, 20}, -- Box-to-box, Holding, Deep-lying Playmaker
-        LM = {27, 28, 30}, -- Winger, Wide Midfielder, Inside Forward
-        CAM = {31, 32, 33}, -- Playmaker, Shadow Striker, Half-Winger
-        ST = {41, 42, 43}, -- Advanced Forward, Poacher, False Nine 
-        RW = {35, 36, 37}, -- Winger, Inside Forward, Wide Playmaker
-        LW = {38, 39, 40} -- Winger, Inside Forward, Wide Playmaker
-    },
+
+-- Core transfer settings
+local TRANSFER_CONFIG = {
+    age_constraints = {min = 16, max = 35},
+    max_squad_size = 52,     -- Hard limit per team
+    target_squad_size = 27,  -- Fill teams up to this size
+    rating_variance = {lower_bound_minus = 1, upper_bound_plus = 1},
+    youth_thresholds = {max_age = 23, potential_bonus = 5},
+    source_team_id = 111592  -- Free agents pool
+}
+
+-- Player position system
+local POSITION_SYSTEM = {
+    -- Position ID mappings for database queries
     position_ids = {
         GK = {0}, CB = {5, 1, 4, 6}, RB = {3, 2}, LB = {7, 8},
         CDM = {10, 9, 11}, RM = {12}, CM = {14, 13, 15}, LM = {16},
         CAM = {18, 17, 19}, ST = {25, 20, 21, 22, 24, 26},
         RW = {23}, LW = {27}
     },
-    age_constraints = {min = 16, max = 35},
-    max_squad_size = 52,  -- Absolute maximum squad size (hard limit)
-    target_squad_size = 27, -- Target squad size to fill teams up to
-    target_leagues = {61,60,14,13,16,17,19,20,2076,31,32,10,83,53,54,353,351,80,4,2012,1,2149,41,66,308,65,330,350,50,56,189,68,39},
-    excluded_teams = { [110] = true },
-    transfer = {
-        sum = 0,
-        wage = 600,
-        contract_length = 24,
-        release_clause = -1,
-        from_team_id = 111592
+    -- Role assignments for each position
+    roles = {
+        GK = {1, 2, 0}, CB = {11, 12, 13}, RB = {3, 4, 5}, LB = {7, 8, 9},
+        CDM = {14, 15, 16}, RM = {23, 24, 26}, CM = {18, 19, 20}, LM = {27, 28, 30},
+        CAM = {31, 32, 33}, ST = {41, 42, 43}, RW = {35, 36, 37}, LW = {38, 39, 40}
     },
-    lower_bound_minus = 1, -- Range subtracted from team's median rating
-    upper_bound_plus = 1,  -- Range added to team's 75th percentile rating
-    youth_player = {
-        max_age = 23,      -- Maximum age for youth players
-        potential_bonus = 5 -- Potential must be >= team median + this value
-    },
-    position_groups = {
-        GK = {"GK"},
-        DEF = {"CB", "LB", "RB"},
-        MID = {"CM", "CDM"},
-        AM = {"RM", "LM", "RW", "LW", "CAM"},
-        ST = {"ST"}
-    },
-    group_ratios = {
-        GK = 1,   -- 1 part
-        DEF = 2,  -- 2 parts  
-        MID = 2,  -- 2 parts
-        AM = 2,   -- 2 parts
-        ST = 1    -- 1 part
-    }  -- Total: 8 parts
+    -- Strategic position groupings with target ratios
+    groups = {
+        definitions = {
+            GK = {"GK"}, DEF = {"CB", "LB", "RB"}, MID = {"CM", "CDM"},
+            AM = {"RM", "LM", "RW", "LW", "CAM"}, ST = {"ST"}
+        },
+        ratios = {GK = 1, DEF = 2, MID = 2, AM = 2, ST = 1} -- Total: 8 parts
+    }
 }
 
--- Pre-compute position mappings for faster lookups
+-- League and team filtering
+local TEAM_FILTER = {
+    target_leagues = {61,60,14,13,16,17,19,20,2076,31,32,10,83,53,54,353,351,80,4,2012,1,2149,41,66,308,65,330,350,50,56,189,68,39},
+    excluded_teams = {[110] = true},
+    transfer_terms = {sum = 0, wage = 600, contract_length = 24, release_clause = -1}
+}
+
+-- Constants for readability
+local SEARCH_STEPS = {
+    PRIORITY_REGULAR = 1, PRIORITY_YOUTH = 2,
+    FORMATION_REGULAR = 3, FORMATION_YOUTH = 4,
+    ANY_REGULAR = 5, ANY_YOUTH = 6
+}
+
+local TOTAL_RATIO_PARTS = 8
+
+--------------------------------------------------------------------------------
+-- POSITION MAPPING INITIALIZATION
+-- Pre-compute lookups for performance
+--------------------------------------------------------------------------------
 local position_name_by_id = {}
-for name, ids in pairs(config.position_ids) do
-    for _, pid in ipairs(ids) do
-        position_name_by_id[pid] = name
+local position_to_group = {}
+
+-- Build position ID to name mapping
+for position_name, id_list in pairs(POSITION_SYSTEM.position_ids) do
+    for _, position_id in ipairs(id_list) do
+        position_name_by_id[position_id] = position_name
     end
 end
 
--- Pre-compute position to group mapping
-local position_to_group = {}
-for group_name, positions in pairs(config.position_groups) do
-    for _, position in ipairs(positions) do
-        position_to_group[position] = group_name
+-- Build position to strategic group mapping
+for group_name, position_list in pairs(POSITION_SYSTEM.groups.definitions) do
+    for _, position_name in ipairs(position_list) do
+        position_to_group[position_name] = group_name
     end
 end
 
@@ -126,7 +135,7 @@ local function build_league_cache()
     while record > 0 do
         local league_id = league_team_links_global:GetRecordFieldValue(record, "leagueid")
         local team_id = league_team_links_global:GetRecordFieldValue(record, "teamid")
-        if league_id and team_id and not config.excluded_teams[team_id] then
+        if league_id and team_id and not TEAM_FILTER.excluded_teams[team_id] then
             cache.league_teams[league_id] = cache.league_teams[league_id] or {}
             table.insert(cache.league_teams[league_id], team_id)
         end
@@ -176,12 +185,17 @@ local function build_team_ratings_cache()
         
         if #ratings > 0 then
             table.sort(ratings)
-            local n = #ratings
-            local i50, i75 = math.ceil(0.5 * n), math.ceil(0.75 * n)
-            local p50, p75 = math.floor(ratings[i50] + 0.5), math.floor(ratings[i75] + 0.5)
-            local lb, ub = p50 - config.lower_bound_minus, p75 + config.upper_bound_plus
+            local count = #ratings
+            local median_index = math.ceil(0.5 * count)
+            local p75_index = math.ceil(0.75 * count)
+            local median = math.floor(ratings[median_index] + 0.5)
+            local p75 = math.floor(ratings[p75_index] + 0.5)
             
-            cache.team_ratings[team_id] = {lb, ub, p50, p75} -- Store median and 75th percentile for logging
+            -- Apply rating variance for transfer targeting
+            local min_rating = median - TRANSFER_CONFIG.rating_variance.lower_bound_minus
+            local max_rating = p75 + TRANSFER_CONFIG.rating_variance.upper_bound_plus
+            
+            cache.team_ratings[team_id] = {min_rating, max_rating, median, p75}
         end
     end
 end
@@ -198,24 +212,45 @@ local function initialize_caches()
 end
 
 --------------------------------------------------------------------------------
--- HELPER METHODS
+-- UTILITY FUNCTIONS
+-- Core helper functions for data processing
 --------------------------------------------------------------------------------
-local function get_position_name_from_position_id(pid)
-    return position_name_by_id[pid] or ("UnknownPos(".. pid ..")")
+
+-- Convert position ID to readable name
+local function get_position_name_from_id(position_id)
+    return position_name_by_id[position_id] or ("UnknownPos(".. position_id ..")")
 end
 
+-- Calculate current age from birth date
 local function calculate_player_age(birth_date)
     if not birth_date or birth_date <= 0 then return 20 end
-    local c = GetCurrentDate()
-    local d = DATE:new(); d:FromGregorianDays(birth_date)
-    local age = c.year - d.year
-    if c.month < d.month or (c.month==d.month and c.day<d.day) then
+    
+    local current_date = GetCurrentDate()
+    local birth_date_obj = DATE:new()
+    birth_date_obj:FromGregorianDays(birth_date)
+    
+    local age = current_date.year - birth_date_obj.year
+    
+    -- Adjust if birthday hasn't occurred this year
+    if current_date.month < birth_date_obj.month or 
+       (current_date.month == birth_date_obj.month and current_date.day < birth_date_obj.day) then
         age = age - 1
     end
+    
     return age
 end
 
--- Cached helper functions for performance
+-- Check if player meets age requirements
+local function is_valid_age(age)
+    return age >= TRANSFER_CONFIG.age_constraints.min and age <= TRANSFER_CONFIG.age_constraints.max
+end
+
+--------------------------------------------------------------------------------
+-- CACHED DATA ACCESS
+-- Performance-optimized data retrieval functions
+--------------------------------------------------------------------------------
+
+-- Get team name with caching
 local function get_cached_team_name(team_id)
     if not cache.team_names[team_id] then
         cache.team_names[team_id] = GetTeamName(team_id)
@@ -223,6 +258,7 @@ local function get_cached_team_name(team_id)
     return cache.team_names[team_id]
 end
 
+-- Get player name with caching
 local function get_cached_player_name(player_id)
     if not cache.player_names[player_id] then
         cache.player_names[player_id] = GetPlayerName(player_id)
@@ -230,49 +266,27 @@ local function get_cached_player_name(player_id)
     return cache.player_names[player_id]
 end
 
+-- Get current team size from cache
 local function get_team_size_cached(team_id)
     return cache.team_sizes[team_id] or 0
 end
 
-local function update_team_size_cache(team_id, change)
-    cache.team_sizes[team_id] = (cache.team_sizes[team_id] or 0) + change
+-- Update team size cache after transfers
+local function update_team_size_cache(team_id, size_change)
+    cache.team_sizes[team_id] = (cache.team_sizes[team_id] or 0) + size_change
 end
 
-local function update_player_roles_cached(player_id, position_name)
-    local roles = config.positions_to_roles[position_name]
-    if not roles then 
-        LOGGER:LogWarning(string.format("No roles found for position %s", position_name))
-        return 
-    end
-    
-    local player_data = cache.player_data[player_id]
-    if not player_data then
-        LOGGER:LogWarning(string.format("Player %d not found in cache. Could not update roles.", player_id))
-        return
-    end
-    
-    local pos = player_data.preferred_position
-    local r1, r2, r3 = roles[1], roles[2], roles[3]
-    if pos == 0 then r3 = 0 end -- Goalkeeper special case
-    
-    -- Use cached record ID for direct access
-    local rec = player_data.record_id
-    if rec and rec > 0 then
-        players_table_global:SetRecordFieldValue(rec, "role1", r1)
-        players_table_global:SetRecordFieldValue(rec, "role2", r2)
-        players_table_global:SetRecordFieldValue(rec, "role3", r3)
-    end
-end
-
+-- Get team rating bounds with all statistics
 local function get_team_rating_bounds_cached(team_id)
     local bounds = cache.team_ratings[team_id]
     if bounds then
-        return bounds[1], bounds[2], bounds[3], bounds[4] -- min_rating, max_rating, median_rating, p75_rating
+        return bounds[1], bounds[2], bounds[3], bounds[4] -- min, max, median, p75
     end
     return nil, nil, nil, nil
 end
 
-local function get_team_name_with_stats(team_id)
+-- Format team name with rating statistics for display
+local function get_team_display_name(team_id)
     local team_name = get_cached_team_name(team_id)
     local _, _, median_rating, p75_rating = get_team_rating_bounds_cached(team_id)
     
@@ -283,124 +297,183 @@ local function get_team_name_with_stats(team_id)
     end
 end
 
+-- Update player roles based on position
+local function update_player_roles(player_id, position_name)
+    local role_config = POSITION_SYSTEM.roles[position_name]
+    if not role_config then 
+        LOGGER:LogWarning(string.format("No roles found for position %s", position_name))
+        return 
+    end
+    
+    local player_data = cache.player_data[player_id]
+    if not player_data then
+        LOGGER:LogWarning(string.format("Player %d not found in cache", player_id))
+        return
+    end
+    
+    local role1, role2, role3 = role_config[1], role_config[2], role_config[3]
+    
+    -- Goalkeeper special case: no third role
+    if player_data.preferred_position == 0 then 
+        role3 = 0 
+    end
+    
+    -- Update roles using cached record reference
+    local record_id = player_data.record_id
+    if record_id and record_id > 0 then
+        players_table_global:SetRecordFieldValue(record_id, "role1", role1)
+        players_table_global:SetRecordFieldValue(record_id, "role2", role2)
+        players_table_global:SetRecordFieldValue(record_id, "role3", role3)
+    end
+end
+
 --------------------------------------------------------------------------------
--- POSITIONAL GROUPING AND RATIO LOGIC
+-- POSITION GROUP ANALYSIS
+-- Strategic position balancing based on formation ratios
 --------------------------------------------------------------------------------
 
--- Count players by position group for a team
+-- Count current players by strategic group
 local function count_players_by_group(team_id)
     local group_counts = {GK = 0, DEF = 0, MID = 0, AM = 0, ST = 0}
     
-    local rec = team_player_links_global:GetFirstRecord()
-    while rec > 0 do
-        if team_player_links_global:GetRecordFieldValue(rec, "teamid") == team_id then
-            local player_id = team_player_links_global:GetRecordFieldValue(rec, "playerid")
+    local record = team_player_links_global:GetFirstRecord()
+    while record > 0 do
+        if team_player_links_global:GetRecordFieldValue(record, "teamid") == team_id then
+            local player_id = team_player_links_global:GetRecordFieldValue(record, "playerid")
             local player_data = cache.player_data[player_id]
             
             if player_data and player_data.preferred_position then
-                local position_name = get_position_name_from_position_id(player_data.preferred_position)
-                local group = position_to_group[position_name]
-                if group then
-                    group_counts[group] = group_counts[group] + 1
+                local position_name = get_position_name_from_id(player_data.preferred_position)
+                local group_name = position_to_group[position_name]
+                if group_name then
+                    group_counts[group_name] = group_counts[group_name] + 1
                 end
             end
         end
-        rec = team_player_links_global:GetNextValidRecord()
+        record = team_player_links_global:GetNextValidRecord()
     end
     
     return group_counts
 end
 
--- Calculate underrepresented position groups in order of priority
-local function get_underrepresented_position_groups(team_id, squad_size)
-    local group_counts = count_players_by_group(team_id)
-    local total_ratio_parts = 8 -- GK(1) + DEF(2) + MID(2) + AM(2) + ST(1) = 8
-    local players_per_part = squad_size / total_ratio_parts
+-- Calculate ideal group distribution based on squad size
+local function calculate_group_targets(squad_size)
+    local players_per_ratio_part = squad_size / TOTAL_RATIO_PARTS
+    local group_targets = {}
+    
+    for group_name, ratio in pairs(POSITION_SYSTEM.groups.ratios) do
+        local ideal_count = ratio * players_per_ratio_part
+        group_targets[group_name] = {
+            ideal = math.floor(ideal_count + 0.5), -- Round to nearest integer
+            ratio = ratio
+        }
+    end
+    
+    return group_targets
+end
+
+-- Analyze position group needs and prioritize underrepresented groups
+local function get_underrepresented_groups(team_id, squad_size)
+    local current_counts = count_players_by_group(team_id)
+    local target_counts = calculate_group_targets(squad_size)
     
     local group_analysis = {}
-    local underrepresented_groups = {}
+    local underrepresented_list = {}
     
-    for group_name, ratio in pairs(config.group_ratios) do
-        local ideal_count = ratio * players_per_part
-        local actual_count = group_counts[group_name]
-        local shortfall = 0
+    -- Analyze each position group
+    for group_name, targets in pairs(target_counts) do
+        local actual_count = current_counts[group_name] or 0
+        local ideal_count = targets.ideal
+        local shortfall_percentage = 0
         
+        -- Calculate proportional shortfall (how underrepresented relative to ideal)
         if ideal_count > 0 then
-            shortfall = math.max(0, (ideal_count - actual_count) / ideal_count)
+            shortfall_percentage = math.max(0, (ideal_count - actual_count) / ideal_count)
         end
         
         group_analysis[group_name] = {
-            ideal = math.floor(ideal_count + 0.5), -- Round to nearest integer
             actual = actual_count,
-            shortfall = shortfall
+            ideal = ideal_count,
+            shortfall = shortfall_percentage
         }
         
-        -- Only include groups with shortfall
-        if shortfall > 0 then
-            table.insert(underrepresented_groups, {
+        -- Track groups that need more players
+        if shortfall_percentage > 0 then
+            table.insert(underrepresented_list, {
                 group = group_name,
-                shortfall = shortfall
+                shortfall = shortfall_percentage
             })
         end
     end
     
-    -- Pre-shuffle to randomize ties, then sort by shortfall (highest first)
-    for i = #underrepresented_groups, 2, -1 do
+    -- Randomize order for equal shortfalls, then sort by priority
+    for i = #underrepresented_list, 2, -1 do
         local j = math.random(i)
-        underrepresented_groups[i], underrepresented_groups[j] = underrepresented_groups[j], underrepresented_groups[i]
+        underrepresented_list[i], underrepresented_list[j] = underrepresented_list[j], underrepresented_list[i]
     end
     
-    table.sort(underrepresented_groups, function(a, b)
+    table.sort(underrepresented_list, function(a, b)
         return a.shortfall > b.shortfall
     end)
     
-    -- Extract just the group names in priority order
+    -- Extract prioritized group names
     local priority_groups = {}
-    for _, entry in ipairs(underrepresented_groups) do
+    for _, entry in ipairs(underrepresented_list) do
         table.insert(priority_groups, entry.group)
     end
     
     return priority_groups, group_analysis
 end
 
--- Get all positions in a position group
+-- Get all positions within a strategic group
 local function get_positions_in_group(group_name)
-    return config.position_groups[group_name] or {}
+    return POSITION_SYSTEM.groups.definitions[group_name] or {}
 end
 
--- Get formation positions for a team (excluding GK)
+--------------------------------------------------------------------------------
+-- FORMATION ANALYSIS
+-- Team formation-based position requirements
+--------------------------------------------------------------------------------
 local formation_cache = {}
-local function get_formation_positions(target_team_id)
-    if formation_cache[target_team_id] then
-        return formation_cache[target_team_id]
+
+-- Get outfield positions from team's formation (excludes GK)
+local function get_formation_positions(team_id)
+    -- Return cached result if available
+    if formation_cache[team_id] then
+        return formation_cache[team_id]
     end
     
     if not formations_table_global then
-        formation_cache[target_team_id] = {}
+        formation_cache[team_id] = {}
         return {}
     end
 
     local record = formations_table_global:GetFirstRecord()
     while record > 0 do
-        local team_id_current = formations_table_global:GetRecordFieldValue(record, "teamid")
-        if team_id_current == target_team_id then
-            local positions = {}
-            for i=0,10 do
-                local field_name = ("position%d"):format(i)
+        local current_team_id = formations_table_global:GetRecordFieldValue(record, "teamid")
+        if current_team_id == team_id then
+            local formation_positions = {}
+            
+            -- Extract all formation positions (0-10 slots)
+            for slot_index = 0, 10 do
+                local field_name = string.format("position%d", slot_index)
                 local position_id = formations_table_global:GetRecordFieldValue(record, field_name) or 0
-                local position_name = get_position_name_from_position_id(position_id)
-                -- Exclude GK (position 0) from formation positions
+                local position_name = get_position_name_from_id(position_id)
+                
+                -- Include all outfield positions (exclude GK)
                 if position_id ~= 0 and position_name ~= "GK" then
-                    positions[#positions+1] = position_name
+                    table.insert(formation_positions, position_name)
                 end
             end
-            formation_cache[target_team_id] = positions
-            return positions
+            
+            formation_cache[team_id] = formation_positions
+            return formation_positions
         end
         record = formations_table_global:GetNextValidRecord()
     end
     
-    formation_cache[target_team_id] = {}
+    -- Cache empty result if team formation not found
+    formation_cache[team_id] = {}
     return {}
 end
 
@@ -411,12 +484,12 @@ local function get_teams_by_squad_size_cached()
     local teams = {}
     
     -- Use cached league-team mapping
-    for _, league_id in ipairs(config.target_leagues) do
+    for _, league_id in ipairs(TEAM_FILTER.target_leagues) do
         local teams_in_league = cache.league_teams[league_id] or {}
         for _, team_id in ipairs(teams_in_league) do
-            local size = get_team_size_cached(team_id)
-            if size < config.target_squad_size and size < config.max_squad_size then
-                table.insert(teams, {team_id = team_id, squad_size = size})
+            local current_size = get_team_size_cached(team_id)
+            if current_size < TRANSFER_CONFIG.target_squad_size and current_size < TRANSFER_CONFIG.max_squad_size then
+                table.insert(teams, {team_id = team_id, squad_size = current_size})
             end
         end
     end
@@ -434,28 +507,28 @@ local function get_eligible_free_agents_cached()
     local free_agents = {}
     
     -- Find players in the source team using cached data
-    local rec = team_player_links_global:GetFirstRecord()
-    while rec > 0 do
-        local t_id = team_player_links_global:GetRecordFieldValue(rec, "teamid")
-        local p_id = team_player_links_global:GetRecordFieldValue(rec, "playerid")
+    local record = team_player_links_global:GetFirstRecord()
+    while record > 0 do
+        local team_id = team_player_links_global:GetRecordFieldValue(record, "teamid")
+        local player_id = team_player_links_global:GetRecordFieldValue(record, "playerid")
         
-        if t_id == config.transfer.from_team_id and p_id then
-            local player_data = cache.player_data[p_id]
+        if team_id == TRANSFER_CONFIG.source_team_id and player_id then
+            local player_data = cache.player_data[player_id]
             if player_data then
                 local age = calculate_player_age(player_data.birthdate)
                 
-                if age >= config.age_constraints.min and age <= config.age_constraints.max then
-                    local pos_name = get_position_name_from_position_id(player_data.preferred_position)
+                if is_valid_age(age) then
+                    local position_name = get_position_name_from_id(player_data.preferred_position)
                     table.insert(free_agents, {
-                        playerid = p_id,
+                        playerid = player_id,
                         overall = player_data.overall,
                         age = age,
-                        position_name = pos_name
+                        position_name = position_name
                     })
                 end
             end
         end
-        rec = team_player_links_global:GetNextValidRecord()
+        record = team_player_links_global:GetNextValidRecord()
     end
     
     -- Shuffle the free agents to add randomness
@@ -501,10 +574,10 @@ end
 -- FIND SUITABLE YOUTH PLAYER FOR TEAM
 --------------------------------------------------------------------------------
 local function find_suitable_youth_player(team_id, free_agents, median_rating)
-    local min_potential = median_rating + config.youth_player.potential_bonus
+    local min_potential = median_rating + TRANSFER_CONFIG.youth_thresholds.potential_bonus
     
     for i, player in ipairs(free_agents) do
-        if player.age <= config.youth_player.max_age then
+        if player.age <= TRANSFER_CONFIG.youth_thresholds.max_age then
             -- Get player's potential from cache
             local player_data = cache.player_data[player.playerid]
             if player_data then
@@ -520,12 +593,12 @@ end
 
 -- Find suitable youth player prioritizing specific position group (NO FALLBACK)
 local function find_suitable_youth_player_by_group_only(team_id, free_agents, median_rating, target_group)
-    local min_potential = median_rating + config.youth_player.potential_bonus
+    local min_potential = median_rating + TRANSFER_CONFIG.youth_thresholds.potential_bonus
     local target_positions = get_positions_in_group(target_group)
     
     -- Only try to find a youth player in the target group, no fallback
     for i, player in ipairs(free_agents) do
-        if player.age <= config.youth_player.max_age then
+        if player.age <= TRANSFER_CONFIG.youth_thresholds.max_age then
             local player_data = cache.player_data[player.playerid]
             if player_data then
                 local potential = players_table_global:GetRecordFieldValue(player_data.record_id, "potential") or 0
@@ -580,12 +653,12 @@ local function find_suitable_youth_player_by_formation(team_id, free_agents, med
         return nil, nil, nil
     end
     
-    local min_potential = median_rating + config.youth_player.potential_bonus
+    local min_potential = median_rating + TRANSFER_CONFIG.youth_thresholds.potential_bonus
     
     -- Shuffle formation positions to add randomness
     local shuffled_positions = {}
-    for _, pos in ipairs(formation_positions) do
-        table.insert(shuffled_positions, pos)
+    for _, position in ipairs(formation_positions) do
+        table.insert(shuffled_positions, position)
     end
     
     for i = #shuffled_positions, 2, -1 do
@@ -596,7 +669,7 @@ local function find_suitable_youth_player_by_formation(team_id, free_agents, med
     -- Try each formation position randomly
     for _, formation_position in ipairs(shuffled_positions) do
         for i, player in ipairs(free_agents) do
-            if player.age <= config.youth_player.max_age and player.position_name == formation_position then
+            if player.age <= TRANSFER_CONFIG.youth_thresholds.max_age and player.position_name == formation_position then
                 local player_data = cache.player_data[player.playerid]
                 if player_data then
                     local potential = players_table_global:GetRecordFieldValue(player_data.record_id, "potential") or 0
@@ -611,68 +684,316 @@ local function find_suitable_youth_player_by_formation(team_id, free_agents, med
     return nil, nil, nil
 end
 
+-- Search strategy definitions for modular player searching
+-- To add new search methods: 
+--   1. Add strategy definition here with requires_* flags and search_func
+--   2. Implement the search function following existing signature patterns
+--   3. System will automatically incorporate it into the search sequence
+local SEARCH_STRATEGIES = {
+    {
+        name = "Priority Groups (Regular)",
+        step_number = 1,
+        requires_groups = true,
+        is_youth = false,
+        search_func = find_suitable_player_by_group_only
+    },
+    {
+        name = "Priority Groups (Youth)",
+        step_number = 2,
+        requires_groups = true,
+        is_youth = true,
+        search_func = find_suitable_youth_player_by_group_only
+    },
+    {
+        name = "Formation (Regular)",
+        step_number = 3,
+        requires_formation = true,
+        is_youth = false,
+        search_func = find_suitable_player_by_formation
+    },
+    {
+        name = "Formation (Youth)",
+        step_number = 4,
+        requires_formation = true,
+        is_youth = true,
+        search_func = find_suitable_youth_player_by_formation
+    },
+    {
+        name = "Any Regular Player",
+        step_number = 5,
+        is_youth = false,
+        search_func = find_suitable_player
+    },
+    {
+        name = "Any Youth Player",
+        step_number = 6,
+        is_youth = true,
+        search_func = find_suitable_youth_player
+    }
+}
+
 --------------------------------------------------------------------------------
--- TRANSFER PLAYER TO TEAM
+-- PLAYER SEARCH SYSTEM
+-- Modular and extensible player search strategies
 --------------------------------------------------------------------------------
-local function transfer_player_to_team_cached(player, team_id, free_agents, player_index, is_youth_transfer, player_potential, team_median, selected_group, target_group, search_step)
+
+-- Create search context for team player needs
+local function create_search_context(team_id, free_agents, min_rating, max_rating, median_rating)
+    local underrepresented_groups = get_underrepresented_groups(team_id, get_team_size_cached(team_id))
+    local formation_positions = get_formation_positions(team_id)
+    
+    return {
+        team_id = team_id,
+        free_agents = free_agents,
+        min_rating = min_rating,
+        max_rating = max_rating,
+        median_rating = median_rating,
+        underrepresented_groups = underrepresented_groups,
+        formation_positions = formation_positions
+    }
+end
+
+-- Check if search strategy requirements are met
+local function can_execute_strategy(strategy, context)
+    if strategy.requires_groups and #context.underrepresented_groups == 0 then
+        return false
+    end
+    if strategy.requires_formation and #context.formation_positions == 0 then
+        return false
+    end
+    return true
+end
+
+-- Execute a single search strategy
+local function execute_search_strategy(strategy, context)
+    if not can_execute_strategy(strategy, context) then
+        return nil
+    end
+    
+    local search_func = strategy.search_func
+    local player_index, suitable_player, player_potential, selected_group = nil, nil, nil, nil
+    
+    -- Handle different search function signatures based on strategy type
+    if strategy.requires_groups then
+        -- Search through all underrepresented groups
+        for _, target_group in ipairs(context.underrepresented_groups) do
+            if strategy.is_youth then
+                player_index, suitable_player, player_potential, selected_group = 
+                    search_func(context.team_id, context.free_agents, context.median_rating, target_group)
+            else
+                player_index, suitable_player, selected_group = 
+                    search_func(context.team_id, context.free_agents, context.min_rating, context.max_rating, target_group)
+            end
+            
+            if player_index then
+                local search_step = string.format("Step %d: %s %s", 
+                    strategy.step_number, strategy.name, target_group)
+                return {
+                    player_index = player_index,
+                    suitable_player = suitable_player,
+                    selected_group = selected_group,
+                    is_youth_transfer = strategy.is_youth,
+                    player_potential = player_potential,
+                    search_step = search_step
+                }
+            end
+        end
+    else
+        -- Single search attempt
+        if strategy.is_youth then
+            player_index, suitable_player, player_potential = 
+                search_func(context.team_id, context.free_agents, context.median_rating)
+        else
+            player_index, suitable_player = 
+                search_func(context.team_id, context.free_agents, context.min_rating, context.max_rating)
+        end
+        
+        if player_index then
+            selected_group = position_to_group[suitable_player.position_name]
+            local search_step = string.format("Step %d: %s", strategy.step_number, strategy.name)
+            return {
+                player_index = player_index,
+                suitable_player = suitable_player,
+                selected_group = selected_group,
+                is_youth_transfer = strategy.is_youth,
+                player_potential = player_potential,
+                search_step = search_step
+            }
+        end
+    end
+    
+    return nil
+end
+
+-- Execute all search strategies until a player is found
+local function find_suitable_player_for_team(search_context)
+    for _, strategy in ipairs(SEARCH_STRATEGIES) do
+        local result = execute_search_strategy(strategy, search_context)
+        if result then
+            return result
+        end
+    end
+    return nil -- All strategies failed
+end
+
+--------------------------------------------------------------------------------
+-- PLAYER TRANSFER SYSTEM
+-- Modular transfer handling with clear data structures
+--------------------------------------------------------------------------------
+
+-- Transfer context data structure for cleaner function signatures
+local function create_transfer_context(player, team_id, free_agents, player_index, search_result)
+    return {
+        player = player,
+        team_id = team_id,
+        free_agents = free_agents,
+        player_index = player_index,
+        search_result = search_result
+    }
+end
+
+-- Execute the actual transfer operation
+local function execute_transfer(transfer_context)
+    local player = transfer_context.player
+    local team_id = transfer_context.team_id
     local player_id = player.playerid
-    local player_name = get_cached_player_name(player_id)
-    local team_name_with_stats = get_team_name_with_stats(team_id)
-    local old_squad_size = get_team_size_cached(team_id)
     
     local ok, error_message = pcall(function()
+        -- Clear existing contracts
         if IsPlayerPresigned(player_id) then DeletePresignedContract(player_id) end
         if IsPlayerLoanedOut(player_id) then TerminateLoan(player_id) end
         
-        TransferPlayer(player_id, team_id, config.transfer.sum, config.transfer.wage, 
-                      config.transfer.contract_length, config.transfer.from_team_id, 
-                      config.transfer.release_clause)
+        -- Execute transfer with configured terms
+        TransferPlayer(player_id, team_id, 
+            TEAM_FILTER.transfer_terms.sum, 
+            TEAM_FILTER.transfer_terms.wage, 
+            TEAM_FILTER.transfer_terms.contract_length, 
+            TRANSFER_CONFIG.source_team_id, 
+            TEAM_FILTER.transfer_terms.release_clause)
         
-        -- Update player roles based on their position
+        -- Update player roles for new position
         if player.position_name then
-            update_player_roles_cached(player_id, player.position_name)
+            update_player_roles(player_id, player.position_name)
         end
         
-        -- Update caches after successful transfer
+        -- Update squad size caches
         update_team_size_cache(team_id, 1)
-        update_team_size_cache(config.transfer.from_team_id, -1)
+        update_team_size_cache(TRANSFER_CONFIG.source_team_id, -1)
     end)
     
+    return ok, error_message
+end
+
+-- Generate transfer success log message
+local function log_successful_transfer(transfer_context)
+    local player = transfer_context.player
+    local team_id = transfer_context.team_id
+    local search_result = transfer_context.search_result
+    
+    local player_name = get_cached_player_name(player.playerid)
+    local team_name = get_cached_team_name(team_id)
+    local old_squad_size = get_team_size_cached(team_id) - 1 -- Already updated, so subtract 1
+    local new_squad_size = old_squad_size + 1
+    
+    local step_info = search_result.search_step and string.format(" (%s)", search_result.search_step) or ""
+    
+    if search_result.is_youth_transfer and search_result.player_potential then
+        LOGGER:LogInfo(string.format("YOUTH: %s (%s, %d->%d pot, age %d) -> %s [%d->%d] %s",
+            player_name, player.position_name, player.overall, search_result.player_potential, 
+            player.age, team_name, old_squad_size, new_squad_size, step_info))
+    else
+        LOGGER:LogInfo(string.format("%s (%s, %d, age %d) -> %s [%d->%d] %s",
+            player_name, player.position_name, player.overall, player.age, 
+            team_name, old_squad_size, new_squad_size, step_info))
+    end
+end
+
+-- Main transfer function with simplified interface
+local function transfer_player_to_team(transfer_context)
+    local ok, error_message = execute_transfer(transfer_context)
+    
     if ok then
-        local new_squad_size = old_squad_size + 1
-        
-        -- Build position group status for logging
-        local group_status = ""
-        if selected_group then
-            if target_group and selected_group == target_group then
-                group_status = string.format(" [%s: ✓ Priority]", selected_group)
-            elseif target_group then
-                group_status = string.format(" [%s: Fallback, wanted %s]", selected_group, target_group)
-            else
-                group_status = string.format(" [%s: Balanced]", selected_group)
-            end
-        end
-        
-        -- Add search step to logging
-        local step_info = search_step and string.format(" (%s)", search_step) or ""
-        
-        if is_youth_transfer and player_potential then
-            LOGGER:LogInfo(string.format("YOUTH: %s (%s, %d->%d pot, age %d) -> %s [%d->%d] %s",
-                player_name, player.position_name, player.overall, player_potential, player.age, 
-                get_cached_team_name(team_id), old_squad_size, new_squad_size, step_info))
-        else
-            LOGGER:LogInfo(string.format("%s (%s, %d, age %d) -> %s [%d->%d] %s",
-                player_name, player.position_name, player.overall, player.age, 
-                get_cached_team_name(team_id), old_squad_size, new_squad_size, step_info))
-        end
-        
-        -- Remove the transferred player from the free agents list
-        table.remove(free_agents, player_index)
+        log_successful_transfer(transfer_context)
+        -- Remove transferred player from free agents pool
+        table.remove(transfer_context.free_agents, transfer_context.player_index)
         return true
     else
-        LOGGER:LogWarning(string.format("Transfer failed: %s → %s (%s)",
-            player_name, get_cached_team_name(team_id), tostring(error_message)))
+        local player_name = get_cached_player_name(transfer_context.player.playerid)
+        local team_name = get_cached_team_name(transfer_context.team_id)
+        LOGGER:LogWarning(string.format("Transfer failed: %s -> %s (%s)",
+            player_name, team_name, tostring(error_message)))
         return false
+    end
+end
+
+--------------------------------------------------------------------------------
+-- TEAM PROCESSING
+-- Core logic for processing individual teams
+--------------------------------------------------------------------------------
+
+-- Process a single team for potential player transfers
+local function process_team_for_transfers(team_id, free_agents, permanently_failed_teams)
+    -- Skip if team is permanently excluded
+    if permanently_failed_teams[team_id] then
+        return false, "permanently_excluded"
+    end
+    
+    local current_squad_size = get_team_size_cached(team_id)
+    
+    -- Skip if team has reached target or maximum capacity
+    if current_squad_size >= TRANSFER_CONFIG.target_squad_size or 
+       current_squad_size >= TRANSFER_CONFIG.max_squad_size then
+        return false, "target_reached"
+    end
+    
+    -- Get team rating requirements
+    local min_rating, max_rating, median_rating = get_team_rating_bounds_cached(team_id)
+    if not min_rating or not max_rating or not median_rating then
+        LOGGER:LogInfo(string.format("SKIP: %s - no rating data, skipping permanently", get_cached_team_name(team_id)))
+        permanently_failed_teams[team_id] = true
+        return false, "no_rating_data"
+    end
+    
+    -- Log team targeting strategy
+    local team_display_name = get_team_display_name(team_id)
+    local underrepresented_groups = get_underrepresented_groups(team_id, current_squad_size)
+    
+    if #underrepresented_groups > 0 then
+        LOGGER:LogInfo(string.format("%s (squad: %d) -> targeting %d-%d rating, priority: [%s]", 
+            team_display_name, current_squad_size, min_rating, max_rating, table.concat(underrepresented_groups, ", ")))
+    else
+        LOGGER:LogInfo(string.format("%s (squad: %d) -> targeting %d-%d rating, balanced squad", 
+            team_display_name, current_squad_size, min_rating, max_rating))
+    end
+    
+    -- Execute modular search system
+    local search_context = create_search_context(team_id, free_agents, min_rating, max_rating, median_rating)
+    local search_result = find_suitable_player_for_team(search_context)
+    
+    if search_result then
+        -- Create transfer context and execute transfer
+        local transfer_context = create_transfer_context(
+            search_result.suitable_player, 
+            team_id, 
+            free_agents, 
+            search_result.player_index, 
+            search_result
+        )
+        
+        local success = transfer_player_to_team(transfer_context)
+        if success then
+            permanently_failed_teams[team_id] = nil -- Remove from failed list if present
+            return true, "transfer_success"
+        else
+            LOGGER:LogWarning(string.format("Transfer failed for %s - will retry", get_cached_team_name(team_id)))
+            return false, "transfer_failed"
+        end
+    else
+        -- All search strategies failed
+        LOGGER:LogInfo(string.format("SKIP: %s - no suitable players found (rating %d-%d), skipping permanently", 
+            get_cached_team_name(team_id), min_rating, max_rating))
+        permanently_failed_teams[team_id] = true
+        return false, "no_suitable_players"
     end
 end
 
@@ -695,9 +1016,9 @@ local function do_simple_transfers()
     local round = 1
     local permanently_failed_teams = {} -- Teams that permanently can't find suitable players
     
-    LOGGER:LogInfo(string.format("Starting transfers: %d free agents -> target squad size %d", #free_agents, config.target_squad_size))
+    LOGGER:LogInfo(string.format("Starting transfers: %d free agents -> target squad size %d", #free_agents, TRANSFER_CONFIG.target_squad_size))
     LOGGER:LogInfo(string.format("Search strategy: Priority groups -> Formation positions -> Any player (Youth: age <=%d, potential >= median+%d)", 
-        config.youth_player.max_age, config.youth_player.potential_bonus))
+        TRANSFER_CONFIG.youth_thresholds.max_age, TRANSFER_CONFIG.youth_thresholds.potential_bonus))
     
     local iteration = 1
     
@@ -753,19 +1074,7 @@ local function do_simple_transfers()
         
         for _, team_info in ipairs(teams_at_smallest_level) do
             local team_id = team_info.team_id
-            
-            -- Double-check team hasn't been permanently excluded
-            if permanently_failed_teams[team_id] then
-                goto continue_team
-            end
-            
-            -- Get fresh squad size (might have changed due to rating cache invalidation)
             local current_squad_size = get_team_size_cached(team_id)
-            
-            -- Skip if team has reached target or is at max capacity
-            if current_squad_size >= config.target_squad_size or current_squad_size >= config.max_squad_size then
-                goto continue_team
-            end
             
             -- Skip if team's squad size has changed since we started this iteration
             if current_squad_size ~= smallest_squad_size then
@@ -774,117 +1083,15 @@ local function do_simple_transfers()
             
             teams_processed = teams_processed + 1
             
-            -- Get team rating bounds from cache
-            local min_rating, max_rating, median_rating, p75_rating = get_team_rating_bounds_cached(team_id)
-            local team_name_with_stats = get_team_name_with_stats(team_id)
+            -- Process team using modular system
+            local success, reason = process_team_for_transfers(team_id, free_agents, permanently_failed_teams)
             
-            if not min_rating or not max_rating or not median_rating then
-                LOGGER:LogInfo(string.format("SKIP: %s - no rating data, skipping permanently", get_cached_team_name(team_id)))
-                permanently_failed_teams[team_id] = true
-                goto continue_team
+            if success then
+                total_transfers = total_transfers + 1
+                transfers_this_iteration = transfers_this_iteration + 1
+                teams_successful = teams_successful + 1
             end
-            
-            -- Analyze position group needs
-            local underrepresented_groups, group_analysis = get_underrepresented_position_groups(team_id, current_squad_size)
-            
-            -- Log team analysis concisely
-            if #underrepresented_groups > 0 then
-                LOGGER:LogInfo(string.format("%s (squad: %d) -> targeting %d-%d rating, priority: [%s]", 
-                    team_name_with_stats, current_squad_size, min_rating, max_rating, table.concat(underrepresented_groups, ", ")))
-            else
-                LOGGER:LogInfo(string.format("%s (squad: %d) -> targeting %d-%d rating, balanced squad", 
-                    team_name_with_stats, current_squad_size, min_rating, max_rating))
-            end
-            
-            -- Explicit 6-step search process with group prioritization and formation logic
-            local player_index, suitable_player, selected_group = nil, nil, nil
-            local is_youth_transfer = false
-            local player_potential = nil
-            local search_step = ""
-            
-            -- Get team formation positions for steps 3 and 4
-            local formation_positions = get_formation_positions(team_id)
-            
-            -- STEP 1: Loop through all underrepresented groups trying to find regular players
-            if #underrepresented_groups > 0 then
-                for _, target_group in ipairs(underrepresented_groups) do
-                    player_index, suitable_player, selected_group = find_suitable_player_by_group_only(team_id, free_agents, min_rating, max_rating, target_group)
-                    if player_index then
-                        search_step = string.format("Step 1: Regular player in priority group %s", target_group)
-                        break
-                    end
-                end
-            end
-            
-            -- STEP 2: Loop through all underrepresented groups trying to find youth players
-            if not player_index and #underrepresented_groups > 0 then
-                for _, target_group in ipairs(underrepresented_groups) do
-                    player_index, suitable_player, player_potential, selected_group = find_suitable_youth_player_by_group_only(team_id, free_agents, median_rating, target_group)
-                    if player_index then
-                        is_youth_transfer = true
-                        search_step = string.format("Step 2: Youth player in priority group %s", target_group)
-                        break
-                    end
-                end
-            end
-            
-            -- STEP 3: Try find regular player matching team formation (excluding GK)
-            if not player_index and #formation_positions > 0 then
-                player_index, suitable_player = find_suitable_player_by_formation(team_id, free_agents, min_rating, max_rating)
-                if player_index then
-                    selected_group = position_to_group[suitable_player.position_name]
-                    search_step = "Step 3: Regular player in formation"
-                end
-            end
-            
-            -- STEP 4: Try find youth player matching team formation (excluding GK)
-            if not player_index and #formation_positions > 0 then
-                player_index, suitable_player, player_potential = find_suitable_youth_player_by_formation(team_id, free_agents, median_rating)
-                if player_index then
-                    selected_group = position_to_group[suitable_player.position_name]
-                    is_youth_transfer = true
-                    search_step = "Step 4: Youth player in formation"
-                end
-            end
-            
-            -- STEP 5: Try find any regular player
-            if not player_index then
-                player_index, suitable_player = find_suitable_player(team_id, free_agents, min_rating, max_rating)
-                if player_index then
-                    selected_group = position_to_group[suitable_player.position_name]
-                    search_step = "Step 5: Any regular player"
-                end
-            end
-            
-            -- STEP 6: Try find any youth player
-            if not player_index then
-                player_index, suitable_player, player_potential = find_suitable_youth_player(team_id, free_agents, median_rating)
-                if player_index then
-                    selected_group = position_to_group[suitable_player.position_name]
-                    is_youth_transfer = true
-                    search_step = "Step 6: Any youth player"
-                end
-            end
-            
-            if player_index and suitable_player then
-                local target_group = #underrepresented_groups > 0 and underrepresented_groups[1] or nil
-                local success = transfer_player_to_team_cached(suitable_player, team_id, free_agents, player_index, is_youth_transfer, player_potential, median_rating, selected_group, target_group, search_step)
-                if success then
-                    total_transfers = total_transfers + 1
-                    transfers_this_iteration = transfers_this_iteration + 1
-                    teams_successful = teams_successful + 1
-                    -- Remove from failed list if somehow they were there
-                    permanently_failed_teams[team_id] = nil
-                else
-                    LOGGER:LogWarning(string.format("Transfer failed for %s - will retry", get_cached_team_name(team_id)))
-                    -- Don't mark as permanently failed for technical issues
-                end
-            else
-                -- All 6 steps failed
-                LOGGER:LogInfo(string.format("SKIP: %s - no suitable players found (rating %d-%d), skipping permanently", 
-                    get_cached_team_name(team_id), min_rating, max_rating))
-                permanently_failed_teams[team_id] = true
-            end
+            -- Note: Failure reasons are already logged within process_team_for_transfers
             
             ::continue_team::
         end
@@ -943,8 +1150,14 @@ end
 
 --------------------------------------------------------------------------------
 -- MAIN SCRIPT EXECUTION
+-- Entry point for the squad filler system
 --------------------------------------------------------------------------------
+
+-- Initialize random seed for player selection fairness
 math.randomseed(os.time())
+
 LOGGER:LogInfo("Starting Simplified Squad Filler Script...")
 
-do_simple_transfers() 
+-- Execute the main transfer process
+-- This will continue until all teams reach target size or no more suitable players exist
+do_simple_transfers()
