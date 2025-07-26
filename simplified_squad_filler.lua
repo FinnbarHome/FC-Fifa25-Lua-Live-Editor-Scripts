@@ -50,7 +50,21 @@ local config = {
     youth_player = {
         max_age = 23,      -- Maximum age for youth players
         potential_bonus = 5 -- Potential must be >= team median + this value
-    }
+    },
+    position_groups = {
+        GK = {"GK"},
+        DEF = {"CB", "LB", "RB"},
+        MID = {"CM", "CDM"},
+        AM = {"RM", "LM", "RW", "LW", "CAM"},
+        ST = {"ST"}
+    },
+    group_ratios = {
+        GK = 1,   -- 1 part
+        DEF = 2,  -- 2 parts  
+        MID = 2,  -- 2 parts
+        AM = 2,   -- 2 parts
+        ST = 1    -- 1 part
+    }  -- Total: 8 parts
 }
 
 -- Pre-compute position mappings for faster lookups
@@ -58,6 +72,14 @@ local position_name_by_id = {}
 for name, ids in pairs(config.position_ids) do
     for _, pid in ipairs(ids) do
         position_name_by_id[pid] = name
+    end
+end
+
+-- Pre-compute position to group mapping
+local position_to_group = {}
+for group_name, positions in pairs(config.position_groups) do
+    for _, position in ipairs(positions) do
+        position_to_group[position] = group_name
     end
 end
 
@@ -264,6 +286,89 @@ local function get_team_name_with_stats(team_id)
 end
 
 --------------------------------------------------------------------------------
+-- POSITIONAL GROUPING AND RATIO LOGIC
+--------------------------------------------------------------------------------
+
+-- Count players by position group for a team
+local function count_players_by_group(team_id)
+    local group_counts = {GK = 0, DEF = 0, MID = 0, AM = 0, ST = 0}
+    
+    local rec = team_player_links_global:GetFirstRecord()
+    while rec > 0 do
+        if team_player_links_global:GetRecordFieldValue(rec, "teamid") == team_id then
+            local player_id = team_player_links_global:GetRecordFieldValue(rec, "playerid")
+            local player_data = cache.player_data[player_id]
+            
+            if player_data and player_data.preferred_position then
+                local position_name = get_position_name_from_position_id(player_data.preferred_position)
+                local group = position_to_group[position_name]
+                if group then
+                    group_counts[group] = group_counts[group] + 1
+                end
+            end
+        end
+        rec = team_player_links_global:GetNextValidRecord()
+    end
+    
+    return group_counts
+end
+
+-- Calculate underrepresented position groups in order of priority
+local function get_underrepresented_position_groups(team_id, squad_size)
+    local group_counts = count_players_by_group(team_id)
+    local total_ratio_parts = 8 -- GK(1) + DEF(2) + MID(2) + AM(2) + ST(1) = 8
+    local players_per_part = squad_size / total_ratio_parts
+    
+    local group_analysis = {}
+    local underrepresented_groups = {}
+    
+    for group_name, ratio in pairs(config.group_ratios) do
+        local ideal_count = ratio * players_per_part
+        local actual_count = group_counts[group_name]
+        local shortfall = 0
+        
+        if ideal_count > 0 then
+            shortfall = math.max(0, (ideal_count - actual_count) / ideal_count)
+        end
+        
+        group_analysis[group_name] = {
+            ideal = math.floor(ideal_count + 0.5), -- Round to nearest integer
+            actual = actual_count,
+            shortfall = shortfall
+        }
+        
+        -- Only include groups with shortfall
+        if shortfall > 0 then
+            table.insert(underrepresented_groups, {
+                group = group_name,
+                shortfall = shortfall
+            })
+        end
+    end
+    
+    -- Sort by shortfall (highest first), with random order for ties
+    table.sort(underrepresented_groups, function(a, b)
+        if math.abs(a.shortfall - b.shortfall) < 0.001 then -- Handle floating point precision
+            return math.random() < 0.5 -- Random order for ties
+        end
+        return a.shortfall > b.shortfall
+    end)
+    
+    -- Extract just the group names in priority order
+    local priority_groups = {}
+    for _, entry in ipairs(underrepresented_groups) do
+        table.insert(priority_groups, entry.group)
+    end
+    
+    return priority_groups, group_analysis
+end
+
+-- Get all positions in a position group
+local function get_positions_in_group(group_name)
+    return config.position_groups[group_name] or {}
+end
+
+--------------------------------------------------------------------------------
 -- GET ALL ELIGIBLE TEAMS SORTED BY SQUAD SIZE (CACHED)
 --------------------------------------------------------------------------------
 local function get_teams_by_squad_size_cached()
@@ -338,6 +443,24 @@ local function find_suitable_player(team_id, free_agents, min_rating, max_rating
     return nil, nil
 end
 
+-- Find suitable player prioritizing specific position group (NO FALLBACK)
+local function find_suitable_player_by_group_only(team_id, free_agents, min_rating, max_rating, target_group)
+    local target_positions = get_positions_in_group(target_group)
+    
+    -- Only try to find a player in the target group, no fallback
+    for i, player in ipairs(free_agents) do
+        if player.overall >= min_rating and player.overall <= max_rating then
+            for _, target_position in ipairs(target_positions) do
+                if player.position_name == target_position then
+                    return i, player, target_group
+                end
+            end
+        end
+    end
+    
+    return nil, nil, nil
+end
+
 --------------------------------------------------------------------------------
 -- FIND SUITABLE YOUTH PLAYER FOR TEAM
 --------------------------------------------------------------------------------
@@ -359,10 +482,35 @@ local function find_suitable_youth_player(team_id, free_agents, median_rating)
     return nil, nil, nil
 end
 
+-- Find suitable youth player prioritizing specific position group (NO FALLBACK)
+local function find_suitable_youth_player_by_group_only(team_id, free_agents, median_rating, target_group)
+    local min_potential = median_rating + config.youth_player.potential_bonus
+    local target_positions = get_positions_in_group(target_group)
+    
+    -- Only try to find a youth player in the target group, no fallback
+    for i, player in ipairs(free_agents) do
+        if player.age <= config.youth_player.max_age then
+            local player_data = cache.player_data[player.playerid]
+            if player_data then
+                local potential = players_table_global:GetRecordFieldValue(player_data.record_id, "potential") or 0
+                if potential >= min_potential then
+                    for _, target_position in ipairs(target_positions) do
+                        if player.position_name == target_position then
+                            return i, player, potential, target_group
+                        end
+                    end
+                end
+            end
+        end
+    end
+    
+    return nil, nil, nil, nil
+end
+
 --------------------------------------------------------------------------------
 -- TRANSFER PLAYER TO TEAM
 --------------------------------------------------------------------------------
-local function transfer_player_to_team_cached(player, team_id, free_agents, player_index, is_youth_transfer, player_potential, team_median)
+local function transfer_player_to_team_cached(player, team_id, free_agents, player_index, is_youth_transfer, player_potential, team_median, selected_group, target_group, search_step)
     local player_id = player.playerid
     local player_name = get_cached_player_name(player_id)
     local team_name_with_stats = get_team_name_with_stats(team_id)
@@ -389,12 +537,27 @@ local function transfer_player_to_team_cached(player, team_id, free_agents, play
     if ok then
         local new_squad_size = old_squad_size + 1
         
+        -- Build position group status for logging
+        local group_status = ""
+        if selected_group then
+            if target_group and selected_group == target_group then
+                group_status = string.format(" [%s: ✓ Priority]", selected_group)
+            elseif target_group then
+                group_status = string.format(" [%s: Fallback, wanted %s]", selected_group, target_group)
+            else
+                group_status = string.format(" [%s: Balanced]", selected_group)
+            end
+        end
+        
+        -- Add search step to logging
+        local step_info = search_step and string.format(" (%s)", search_step) or ""
+        
         if is_youth_transfer and player_potential and team_median then
-            LOGGER:LogInfo(string.format("✓ YOUTH TRANSFER: %s (%d, rating: %d → potential: %d, age: %d) to team %s (%d). Team median: %d. Squad size: %d -> %d.",
-                player_name, player_id, player.overall, player_potential, player.age, team_name_with_stats, team_id, team_median, old_squad_size, new_squad_size))
+            LOGGER:LogInfo(string.format("✓ YOUTH TRANSFER: %s (%d, rating: %d → potential: %d, age: %d, %s) to team %s (%d)%s%s. Team median: %d. Squad size: %d -> %d.",
+                player_name, player_id, player.overall, player_potential, player.age, player.position_name, team_name_with_stats, team_id, group_status, step_info, team_median, old_squad_size, new_squad_size))
         else
-            LOGGER:LogInfo(string.format("Successfully transferred %s (%d, rating: %d, age: %d) to team %s (%d). Squad size: %d -> %d.",
-                player_name, player_id, player.overall, player.age, team_name_with_stats, team_id, old_squad_size, new_squad_size))
+            LOGGER:LogInfo(string.format("Successfully transferred %s (%d, rating: %d, age: %d, %s) to team %s (%d)%s%s. Squad size: %d -> %d.",
+                player_name, player_id, player.overall, player.age, player.position_name, team_name_with_stats, team_id, group_status, step_info, old_squad_size, new_squad_size))
         end
         
         -- Remove the transferred player from the free agents list
@@ -430,6 +593,8 @@ local function do_simple_transfers()
         #free_agents, config.target_squad_size))
     LOGGER:LogInfo(string.format("Youth player fallback: age ≤%d, potential ≥ team_median+%d", 
         config.youth_player.max_age, config.youth_player.potential_bonus))
+    LOGGER:LogInfo("Position group optimization: GK(1):DEF(2):MID(2):AM(2):ST(1) ratio prioritization enabled")
+    LOGGER:LogInfo("4-step search: 1) ALL priority groups regular, 2) ALL priority groups youth, 3) Any regular, 4) Any youth")
     
     local iteration = 1
     
@@ -519,26 +684,87 @@ local function do_simple_transfers()
                 goto continue_team
             end
             
-            LOGGER:LogInfo(string.format("Team %s (%d) - Targeting players with rating %d-%d (squad size: %d)", 
-                team_name_with_stats, team_id, min_rating, max_rating, current_squad_size))
+            -- Analyze position group needs
+            local underrepresented_groups, group_analysis = get_underrepresented_position_groups(team_id, current_squad_size)
             
-            -- Find a suitable player
-            local player_index, suitable_player = find_suitable_player(team_id, free_agents, min_rating, max_rating)
+            -- Log position group analysis
+            local group_status = {}
+            for group_name, analysis in pairs(group_analysis) do
+                table.insert(group_status, string.format("%s: %d/%d", group_name, analysis.actual, analysis.ideal))
+            end
+            
+            if #underrepresented_groups > 0 then
+                LOGGER:LogInfo(string.format("Team %s (%d) - Targeting players with rating %d-%d (squad size: %d). Position groups: [%s]. Priority order: [%s]", 
+                    team_name_with_stats, team_id, min_rating, max_rating, current_squad_size, table.concat(group_status, ", "), table.concat(underrepresented_groups, ", ")))
+            else
+                LOGGER:LogInfo(string.format("Team %s (%d) - Targeting players with rating %d-%d (squad size: %d). Position groups: [%s]. Priority: Balanced", 
+                    team_name_with_stats, team_id, min_rating, max_rating, current_squad_size, table.concat(group_status, ", ")))
+            end
+            
+            -- Explicit 4-step search process with group prioritization
+            local player_index, suitable_player, selected_group = nil, nil, nil
             local is_youth_transfer = false
             local player_potential = nil
+            local search_step = ""
             
-            -- If no regular player found, try youth players
+            -- STEP 1: Loop through all underrepresented groups trying to find regular players
+            if #underrepresented_groups > 0 then
+                for _, target_group in ipairs(underrepresented_groups) do
+                    player_index, suitable_player, selected_group = find_suitable_player_by_group_only(team_id, free_agents, min_rating, max_rating, target_group)
+                    if player_index then
+                        search_step = string.format("Step 1: Regular player in priority group %s", target_group)
+                        break
+                    end
+                end
+            end
+            
+            -- STEP 2: Loop through all underrepresented groups trying to find youth players
+            if not player_index and #underrepresented_groups > 0 then
+                local min_potential = median_rating + config.youth_player.potential_bonus
+                LOGGER:LogInfo(string.format("Team %s (%d) - No regular player in priority groups [%s]. Searching for youth players in priority groups (age ≤%d, potential ≥%d)...", 
+                    team_name_with_stats, team_id, table.concat(underrepresented_groups, ", "), config.youth_player.max_age, min_potential))
+                
+                for _, target_group in ipairs(underrepresented_groups) do
+                    player_index, suitable_player, player_potential, selected_group = find_suitable_youth_player_by_group_only(team_id, free_agents, median_rating, target_group)
+                    if player_index then
+                        is_youth_transfer = true
+                        search_step = string.format("Step 2: Youth player in priority group %s", target_group)
+                        break
+                    end
+                end
+            end
+            
+            -- STEP 3: Try find any regular player
+            if not player_index then
+                if #underrepresented_groups > 0 then
+                    LOGGER:LogInfo(string.format("Team %s (%d) - No player found in priority groups [%s]. Searching for any regular player...", 
+                        team_name_with_stats, team_id, table.concat(underrepresented_groups, ", ")))
+                end
+                
+                player_index, suitable_player = find_suitable_player(team_id, free_agents, min_rating, max_rating)
+                if player_index then
+                    selected_group = position_to_group[suitable_player.position_name]
+                    search_step = "Step 3: Any regular player"
+                end
+            end
+            
+            -- STEP 4: Try find any youth player
             if not player_index then
                 local min_potential = median_rating + config.youth_player.potential_bonus
-                LOGGER:LogInfo(string.format("Team %s (%d) - No regular player found. Searching for youth players (age ≤%d, potential ≥%d)...", 
+                LOGGER:LogInfo(string.format("Team %s (%d) - No regular player found. Searching for any youth player (age ≤%d, potential ≥%d)...", 
                     team_name_with_stats, team_id, config.youth_player.max_age, min_potential))
                 
                 player_index, suitable_player, player_potential = find_suitable_youth_player(team_id, free_agents, median_rating)
-                is_youth_transfer = true
+                if player_index then
+                    selected_group = position_to_group[suitable_player.position_name]
+                    is_youth_transfer = true
+                    search_step = "Step 4: Any youth player"
+                end
             end
             
             if player_index and suitable_player then
-                local success = transfer_player_to_team_cached(suitable_player, team_id, free_agents, player_index, is_youth_transfer, player_potential, median_rating)
+                local target_group = #underrepresented_groups > 0 and underrepresented_groups[1] or nil
+                local success = transfer_player_to_team_cached(suitable_player, team_id, free_agents, player_index, is_youth_transfer, player_potential, median_rating, selected_group, target_group, search_step)
                 if success then
                     total_transfers = total_transfers + 1
                     transfers_this_iteration = transfers_this_iteration + 1
@@ -551,11 +777,12 @@ local function do_simple_transfers()
                     -- Don't mark as permanently failed for technical issues
                 end
             else
-                if is_youth_transfer then
-                    LOGGER:LogInfo(string.format("Team %s (%d) - No suitable youth player found either. Permanently skipping.", 
-                        team_name_with_stats, team_id))
+                -- All 4 steps failed
+                if #underrepresented_groups > 0 then
+                    LOGGER:LogInfo(string.format("Team %s (%d) - All 4 search steps failed (priority groups: [%s], rating: %d-%d). Permanently skipping.", 
+                        team_name_with_stats, team_id, table.concat(underrepresented_groups, ", "), min_rating, max_rating))
                 else
-                    LOGGER:LogInfo(string.format("Team %s (%d) - No suitable player found in rating range %d-%d. Permanently skipping.", 
+                    LOGGER:LogInfo(string.format("Team %s (%d) - All 4 search steps failed (rating: %d-%d). Permanently skipping.", 
                         team_name_with_stats, team_id, min_rating, max_rating))
                 end
                 permanently_failed_teams[team_id] = true
