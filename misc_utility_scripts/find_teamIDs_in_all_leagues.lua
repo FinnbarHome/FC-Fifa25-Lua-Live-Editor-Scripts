@@ -1,7 +1,7 @@
 require 'imports/other/helpers'
 require 'imports/career_mode/helpers'
 
--- This script will build a mapping of leagueID -> list of teamIDs
+-- This script will build a mapping of leagueID -> list of teamIDs - Made By The Mayo Man (themayonnaiseman)
 -- and then print it in a format you can directly copy into another Lua file.
 
 --------------------------------------------------------------------------------

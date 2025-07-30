@@ -1,5 +1,5 @@
 --------------------------------------------------------------------------------
--- Free Agent Analyzer Script for FC 25 Live Editor
+-- Free Agent Analyzer Script for FC 25 Live Editor - Made By The Mayo Man (themayonnaiseman)
 -- Analyzes free agents within age parameters and shows distribution by rating
 --------------------------------------------------------------------------------
 require 'imports/career_mode/helpers'

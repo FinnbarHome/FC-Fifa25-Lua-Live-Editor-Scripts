@@ -1,5 +1,5 @@
 --------------------------------------------------------------------------------
--- Optimal Formation Finder Script for FC 25 Live Editor
+-- Optimal Formation Finder Script for FC 25 Live Editor - Made By The Mayo Man (themayonnaiseman)
 -- Determines the best formation for a given team based on player ratings
 --------------------------------------------------------------------------------
 require 'imports/career_mode/helpers'

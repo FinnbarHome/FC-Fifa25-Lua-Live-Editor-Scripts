@@ -2,7 +2,7 @@ require 'imports/career_mode/helpers'
 require 'imports/other/helpers'
 
 ----------------------------------------------------------------------------
--- 1) Configuration
+-- 1) Configuration - Made By The Mayo Man (themayonnaiseman)
 ----------------------------------------------------------------------------
 -- Change this to the team ID you want to inspect
 local TARGET_TEAM_ID = 12345

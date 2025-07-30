@@ -1,5 +1,5 @@
 --------------------------------------------------------------------------------
--- Lua Script for changing player's preferred positions
+-- Lua Script for changing player's preferred positions - Made By The Mayo Man (themayonnaiseman)
 --------------------------------------------------------------------------------
 
 require 'imports/career_mode/helpers'

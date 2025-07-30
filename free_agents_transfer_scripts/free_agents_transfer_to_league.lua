@@ -1,5 +1,5 @@
 --------------------------------------------------------------------------------
--- Lua Script for Multi-League Player Transfers
+-- Lua Script for Multi-League Player Transfers - Made By The Mayo Man (themayonnaiseman)
 -- with Position IDs Mapping, Priority Queue, and League-Specific Constraints
 --------------------------------------------------------------------------------
 require 'imports/career_mode/helpers'
@@ -50,16 +50,22 @@ local config = {
     age_constraints = {min = 16, max = 32},
     squad_size = 52,
     target_leagues = {61,60,14,13,16,17,19,20,2076,31,32,10,83,53,54,353,351,80,4,2012,1,2149,41,66,308,65,330,350,50,56,189,68,39}, -- Eg: 61 = EFL League Two, 60 = EFL League One, 14 = EFL Championship, premier league, lig 1, lig 2, Bund, bund 2, bund 3, erd, k league, Liga 1, liga 2, argentinan prem, A league, O.Bund, 1A pro l, CSL, 3F Sup L, ISL, Eliteserien, PKO BP Eks, liga port, SSE Airtricity, Superliga, Saudi L, Scot prem, Allsven, CSSL, super lig, MLS
-    excluded_teams = { [110] = true },         -- e.g. { [1234] = true }
+    excluded_teams = { [1952] = true },         -- e.g. { [1234] = true }
     transfer = {
         sum = 0,
         wage = 600,
-        contract_length = 60,
+        contract_length = 24,
         release_clause = -1,
         from_team_id = 111592
     },
-    lower_bound_minus = 1, -- This is the range that the script subtracts from the lower bounds of the team's ratings.
-    upper_bound_plus = 3 -- This is the range that the script adds to the upper bounds of the team's ratings.
+    lower_bound_minus = 2, -- This is the range that the script subtracts from the lower bounds of the team's ratings.
+    upper_bound_plus = 3, -- This is the range that the script adds to the upper bounds of the team's ratings.
+    youth_player = {
+        max_age = 23,        -- Maximum age for youth players (was hardcoded to 24)
+        potential_bonus = 5, -- Potential must be >= team median + this value (when use_median=true)
+        use_median = true    -- true: use team median + bonus (like simplified_squad_filler.lua)
+                            -- false: use team 75th percentile (original behavior)
+    }
 }
 
 -- Pre-compute position mappings for faster lookups
@@ -233,10 +239,10 @@ local function count_positions_in_team(team_id, team_player_links, player_data)
 end
 
 -- Cache team rating bounds
-local team_bounds_cache = {}
+    local team_bounds_cache = {}
 local function get_team_lower_upper_bounds(team_id, team_player_links, player_data, lower_bound_minus, upper_bound_plus)
     if team_bounds_cache[team_id] then
-        return team_bounds_cache[team_id][1], team_bounds_cache[team_id][2]
+        return team_bounds_cache[team_id][1], team_bounds_cache[team_id][2], team_bounds_cache[team_id][3]
     end
 
     local ratings, rec = {}, team_player_links:GetFirstRecord()
@@ -264,8 +270,8 @@ local function get_team_lower_upper_bounds(team_id, team_player_links, player_da
     LOGGER:LogInfo(string.format("Team %s(ID %d): 50%%=%d->LB:%d, 75%%=%d->UB:%d", 
         team_name,team_id,p50,lb,p75,ub))
         
-    team_bounds_cache[team_id] = {lb, ub}
-    return lb, ub
+    team_bounds_cache[team_id] = {lb, ub, p50}
+    return lb, ub, p50
 end
 
 -- Initialize player data and position indexed data
@@ -501,16 +507,19 @@ local function find_alternative_candidate(free_agents_list, position_index, posi
     return nil, false, nil
 end
 
-local function find_youth_potential_candidate(free_agents_list, position_index, position_required, upper_bound)
-    -- Look for high potential youth players (under 24) with potential above team's 75th percentile
-    local max_age = 24
+local function find_youth_potential_candidate(free_agents_list, position_index, position_required, min_potential_required)
+    -- Look for high potential youth players with configurable age and potential requirements
+    -- Age threshold: config.youth_player.max_age (default 23)
+    -- Potential requirement: team median + config.youth_player.potential_bonus when use_median=true
+    --                       or team 75th percentile when use_median=false (original behavior)
+    local max_age = config.youth_player.max_age
     local youth_candidates = {}
     
     -- If we have an index for this position, use it for faster lookups
     if position_index and position_index[position_required] then
         for _, idx in ipairs(position_index[position_required]) do
             local free_agent = free_agents_list[idx]
-            if free_agent.age < max_age and free_agent.potential >= upper_bound then
+            if free_agent.age <= max_age and free_agent.potential >= min_potential_required then
                 youth_candidates[#youth_candidates + 1] = {
                     index = idx,
                     potential = free_agent.potential
@@ -528,7 +537,7 @@ local function find_youth_potential_candidate(free_agents_list, position_index, 
         for i, free_agent in ipairs(free_agents_list) do
             if free_agent.positionName == position_required then
                 local age = free_agent.age or calculate_player_age(player_data[free_agent.playerid].birthdate)
-                if age < max_age and free_agent.potential >= upper_bound then
+                if age <= max_age and free_agent.potential >= min_potential_required then
                     youth_candidates[#youth_candidates + 1] = {
                         index = i,
                         potential = free_agent.potential
@@ -555,7 +564,7 @@ local function find_youth_potential_candidate(free_agents_list, position_index, 
         if position_index and position_index[alt_position] then
             for _, idx in ipairs(position_index[alt_position]) do
                 local free_agent = free_agents_list[idx]
-                if free_agent.age < max_age and free_agent.potential >= upper_bound then
+                if free_agent.age <= max_age and free_agent.potential >= min_potential_required then
                     youth_candidates[#youth_candidates + 1] = {
                         index = idx,
                         potential = free_agent.potential,
@@ -568,7 +577,7 @@ local function find_youth_potential_candidate(free_agents_list, position_index, 
             for i, free_agent in ipairs(free_agents_list) do
                 if free_agent.positionName == alt_position then
                     local age = free_agent.age or calculate_player_age(player_data[free_agent.playerid].birthdate)
-                    if age < max_age and free_agent.potential >= upper_bound then
+                    if age <= max_age and free_agent.potential >= min_potential_required then
                         youth_candidates[#youth_candidates + 1] = {
                             index = i,
                             potential = free_agent.potential,
@@ -626,7 +635,7 @@ local function handle_player_transfer(player_id, team_id, position, league_id, f
                     player_id, new_pos_id, r1, r2, r3))
                 
                 -- Check if player's rating after conversion meets threshold
-                local lower_bound, _ = get_team_lower_upper_bounds(team_id, team_player_links_global, player_data, config.lower_bound_minus, config.upper_bound_plus)
+                local lower_bound, _, _ = get_team_lower_upper_bounds(team_id, team_player_links_global, player_data, config.lower_bound_minus, config.upper_bound_plus)
                 local player_rating = players_table_global:GetRecordFieldValue(player_rec, "overallrating") 
                               or players_table_global:GetRecordFieldValue(player_rec, "overall") or 0
                 
@@ -694,10 +703,18 @@ local function process_team_entry(entry, free_agents_list, position_index)
         return false
     end
 
-    local lower_bound, upper_bound = get_team_lower_upper_bounds(team_id, team_player_links_global, player_data, config.lower_bound_minus, config.upper_bound_plus)
+    local lower_bound, upper_bound, median_rating = get_team_lower_upper_bounds(team_id, team_player_links_global, player_data, config.lower_bound_minus, config.upper_bound_plus)
     if not lower_bound or not upper_bound then
         LOGGER:LogInfo(string.format("No rating stats for team %d; skipping %s.", team_id, req_pos))
         return false
+    end
+
+    -- Calculate youth potential requirement based on config
+    local youth_potential_requirement
+    if config.youth_player.use_median then
+        youth_potential_requirement = median_rating + config.youth_player.potential_bonus
+    else
+        youth_potential_requirement = upper_bound -- Use 75th percentile (original behavior)
     end
 
     local candidate_index = find_candidate(free_agents_list, position_index, req_pos, lower_bound, upper_bound)
@@ -711,7 +728,7 @@ local function process_team_entry(entry, free_agents_list, position_index)
         -- If still no candidate, try high potential youth
         if not candidate_index then
             candidate_index, is_youth_prospect, alt_position =
-                find_youth_potential_candidate(free_agents_list, position_index, req_pos, upper_bound)
+                find_youth_potential_candidate(free_agents_list, position_index, req_pos, youth_potential_requirement)
         end
     end
 

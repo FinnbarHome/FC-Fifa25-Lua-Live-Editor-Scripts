@@ -1,5 +1,5 @@
 --------------------------------------------------------------------------------
--- Team Formation Position Management Script with Position-Count-Based Max
+-- Team Formation Position Management Script with Position-Count-Based Max - Made By The Mayo Man (themayonnaiseman)
 --------------------------------------------------------------------------------
 require 'imports/career_mode/helpers'
 require 'imports/other/helpers'

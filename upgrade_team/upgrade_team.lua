@@ -1,5 +1,5 @@
 --------------------------------------------------------------------------------
--- Team Upgrade Script - Sign Better Free Agents and Clean Up Roster
+-- Team Upgrade Script - Sign Better Free Agents and Clean Up Roster - Made By The Mayo Man (themayonnaiseman)
 --------------------------------------------------------------------------------
 require 'imports/career_mode/helpers'
 require 'imports/other/helpers'

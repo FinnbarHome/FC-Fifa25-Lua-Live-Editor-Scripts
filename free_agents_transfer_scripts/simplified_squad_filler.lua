@@ -1,5 +1,5 @@
 --------------------------------------------------------------------------------
--- Simplified Squad Filler Script for FC 25 Live Editor
+-- Simplified Squad Filler Script for FC 25 Live Editor - Made By The Mayo Man (themayonnaiseman)
 -- 
 -- Modular system for transferring players to teams with smallest squad sizes
 -- Features:
@@ -26,7 +26,7 @@ local TRANSFER_CONFIG = {
     age_constraints = {min = 16, max = 35},
     max_squad_size = 52,     -- Hard limit per team
     target_squad_size = 27,  -- Fill teams up to this size
-    rating_variance = {lower_bound_minus = 1, upper_bound_plus = 1},
+    rating_variance = {lower_bound_minus = 2, upper_bound_plus = 1},
     youth_thresholds = {max_age = 23, potential_bonus = 5},
     source_team_id = 111592  -- Free agents pool
 }
@@ -59,7 +59,7 @@ local POSITION_SYSTEM = {
 -- League and team filtering
 local TEAM_FILTER = {
     target_leagues = {61,60,14,13,16,17,19,20,2076,31,32,10,83,53,54,353,351,80,4,2012,1,2149,41,66,308,65,330,350,50,56,189,68,39},
-    excluded_teams = {[110] = true},
+    excluded_teams = {[1952] = true},
     transfer_terms = {sum = 0, wage = 600, contract_length = 24, release_clause = -1}
 }
 

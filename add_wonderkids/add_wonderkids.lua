@@ -2,7 +2,7 @@ require 'imports/other/helpers'
 require 'imports/career_mode/helpers'
 
 ------------------------------------------------------------------------------
--- 1) CONFIG
+-- 1) CONFIG - Made By The Mayo Man (themayonnaiseman)
 ------------------------------------------------------------------------------
 
 -- How many players to modify (under 20, overall ≤ threshold, potential ≤ threshold)

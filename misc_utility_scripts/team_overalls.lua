@@ -9,7 +9,7 @@ local league_team_links_global = LE.db:GetTable("leagueteamlinks")
 local team_id = 1
 
 --------------------------------------------------------------------------------
--- Calculate and log various rating statistics: min, 25%, 50% (median), 
+-- Calculate and log various rating statistics: min, 25%, 50% (median),  - Made By The Mayo Man (themayonnaiseman)
 -- mean, 75%, and max
 --------------------------------------------------------------------------------
 local function log_team_rating_stats(team_id)

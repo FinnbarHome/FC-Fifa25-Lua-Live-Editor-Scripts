@@ -1,5 +1,5 @@
 --------------------------------------------------------------------------------
--- Lua Script for changing player roles
+-- Lua Script for changing player roles - Made By The Mayo Man (themayonnaiseman)
 --------------------------------------------------------------------------------
 
 require 'imports/career_mode/helpers'

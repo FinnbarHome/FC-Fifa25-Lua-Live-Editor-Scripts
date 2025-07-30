@@ -1,4 +1,4 @@
--- FLIP-BASED POTENTIAL SCRIPT
+-- FLIP-BASED POTENTIAL SCRIPT - Made By The Mayo Man (themayonnaiseman)
 -- Pairs up players of similar age ranges and fully swaps their potential values, 
 -- respecting the condition that potentials remain >= current overall.
 -- Improved for FC 25 Live Editor with better pairing algorithm and configurable options.

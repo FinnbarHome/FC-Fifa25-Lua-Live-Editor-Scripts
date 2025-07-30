@@ -2,7 +2,7 @@ require 'imports/other/helpers'
 require 'imports/career_mode/helpers'
 
 --------------------------------------------------------------------------------
--- CONFIG
+-- CONFIG - Made By The Mayo Man (themayonnaiseman)
 --------------------------------------------------------------------------------
 
 local MIN_AGE = 16
