@@ -1,5 +1,5 @@
 --------------------------------------------------------------------------------
--- Player Potential Fix & Team Boost Script - Made By The Mayo Man (themayonnaiseman)
+-- Team Ratings Boost Script - Made By The Mayo Man (themayonnaiseman)
 --------------------------------------------------------------------------------
 require 'imports/career_mode/helpers'
 require 'imports/other/helpers'
@@ -17,12 +17,10 @@ local playerloans_table_global = LE.db:GetTable("playerloans")
 -- CONFIG
 --------------------------------------------------------------------------------
 
-
-
 local config = {
     -- Target leagues to process (all major leagues)
     target_leagues = {61,60,14,13,16,17,19,20,2076,31,32,10,83,53,54,353,351,80,4,2012,1,2149,41,66,308,65,330,350,50,56,189,68,39},
-    excluded_teams = { [111592] = true, [110] = true }, -- Exclude free agents team
+    excluded_teams = { [111592] = true, [110] = true }, -- Exclude free agents team + team of choice (currently Wolves)
     
     -- Player stat field names
     player_stats = {
@@ -409,12 +407,7 @@ local function boost_player_stats(player_id, player_record, is_gk)
         players_table_global:SetRecordFieldValue(player_record, "modifier", 0)
 
         current_overall = players_table_global:GetRecordFieldValue(player_record, "overallrating")
-        --players_table_global:SetRecordFieldValue(player_record, "overallrating", current_overall + 1)
-        --players_table_global:SetRecordFieldValue(player_record, "overallrating", current_overall - 1)
-
         current_potential = players_table_global:GetRecordFieldValue(player_record, "potential")
-        --players_table_global:SetRecordFieldValue(player_record, "potential", current_potential + 1)
-        --players_table_global:SetRecordFieldValue(player_record, "potential", current_potential - 1)
 
         if current_potential < current_overall then
             players_table_global:SetRecordFieldValue(player_record, "potential", current_overall)
