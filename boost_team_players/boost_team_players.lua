@@ -16,6 +16,9 @@ local playerloans_table_global = LE.db:GetTable("playerloans")
 --------------------------------------------------------------------------------
 -- CONFIG
 --------------------------------------------------------------------------------
+
+
+
 local config = {
     -- Target leagues to process (all major leagues)
     target_leagues = {61,60,14,13,16,17,19,20,2076,31,32,10,83,53,54,353,351,80,4,2012,1,2149,41,66,308,65,330,350,50,56,189,68,39},
@@ -350,29 +353,72 @@ end
 local function boost_player_stats(player_id, player_record, is_gk)
     local stats_boosted = 0
     
+    -- Check if player has development plan
+    local has_dev_plan = false
+
+    local user_team_playerids = GetUserSeniorTeamPlayerIDs() or {}
+    if user_team_playerids[player_id] then
+        has_dev_plan = PlayerHasDevelopementPlan(player_id)
+    end
+
+    
     for _, stat_name in ipairs(config.player_stats) do
-        -- Skip GK stats for non-goalkeepers
-        local is_gk_stat = false
-        for _, gk_stat in ipairs(config.gk_stats) do
-            if stat_name == gk_stat then
-                is_gk_stat = true
-                break
+        current_value_stat =players_table_global:GetRecordFieldValue(player_record, stat_name)
+        if current_value_stat < 99 then
+
+            -- Skip GK stats for non-goalkeepers
+            local is_gk_stat = false
+            for _, gk_stat in ipairs(config.gk_stats) do
+                if stat_name == gk_stat then
+                    is_gk_stat = true
+                    break
+                end
+            end
+            
+            if not is_gk and is_gk_stat then
+                -- Skip goalkeeper stats for non-goalkeepers
+                goto continue
+            end
+            
+            local current_value = players_table_global:GetRecordFieldValue(player_record, stat_name)
+            if current_value and current_value > 0 then
+                local new_value = math.min(99, current_value + 1)
+                
+                -- Set in players table
+                players_table_global:SetRecordFieldValue(player_record, stat_name, new_value)
+                --LOGGER:LogInfo(string.format("Set %s in players table for %s", stat_name, GetPlayerName(player_id)))
+
+                -- Also set in development plan if player has one
+                if has_dev_plan then
+                    PlayerSetValueInDevelopementPlan(player_id, stat_name, new_value)
+                    -- LOGGER:LogInfo(string.format("Set %s in development plan for %s", stat_name, GetPlayerName(player_id)))
+                end
+                
+
+
+                stats_boosted = stats_boosted + 1
             end
         end
-        
-        if not is_gk and is_gk_stat then
-            -- Skip goalkeeper stats for non-goalkeepers
-            goto continue
-        end
-        
-        local current_value = players_table_global:GetRecordFieldValue(player_record, stat_name)
-        if current_value and current_value > 0 then
-            local new_value = math.min(99, current_value + 1)
-            players_table_global:SetRecordFieldValue(player_record, stat_name, new_value)
-            stats_boosted = stats_boosted + 1
-        end
-        
+
         ::continue::
+    end
+    
+    -- Clear Player modifier to not affect overall
+    if stats_boosted > 0 then
+        players_table_global:SetRecordFieldValue(player_record, "modifier", 1)
+        players_table_global:SetRecordFieldValue(player_record, "modifier", 0)
+
+        current_overall = players_table_global:GetRecordFieldValue(player_record, "overallrating")
+        --players_table_global:SetRecordFieldValue(player_record, "overallrating", current_overall + 1)
+        --players_table_global:SetRecordFieldValue(player_record, "overallrating", current_overall - 1)
+
+        current_potential = players_table_global:GetRecordFieldValue(player_record, "potential")
+        --players_table_global:SetRecordFieldValue(player_record, "potential", current_potential + 1)
+        --players_table_global:SetRecordFieldValue(player_record, "potential", current_potential - 1)
+
+        if current_potential < current_overall then
+            players_table_global:SetRecordFieldValue(player_record, "potential", current_overall)
+        end
     end
     
     return stats_boosted
@@ -454,7 +500,7 @@ local function process_team_boosts(team_id)
                 
                 local player_name = GetPlayerName(player.id)
                 LOGGER:LogInfo(string.format(
-                    "    ✓ Boosted %s (%s, Age %d) - OVR: %d → +%d stats [Below median: %d]",
+                    "    - Boosted %s (%s, Age %d) - OVR: %d → +%d stats [Below median: %d]",
                     player_name, player.posName, player.age, player.overall, stats_boosted, team_median
                 ))
             end
