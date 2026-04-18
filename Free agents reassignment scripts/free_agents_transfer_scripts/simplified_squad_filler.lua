@@ -59,7 +59,7 @@ local POSITION_SYSTEM = {
 -- League and team filtering
 local TEAM_FILTER = {
     target_leagues = {61,60,14,13,16,17,19,20,2076,31,32,10,83,53,54,353,351,80,4,2012,1,2149,41,66,308,65,330,350,50,56,189,68,39},
-    excluded_teams = {[1952] = true},
+    excluded_teams = {[1947] = true},
     transfer_terms = {sum = 0, wage = 600, contract_length = 24, release_clause = -1}
 }
 
