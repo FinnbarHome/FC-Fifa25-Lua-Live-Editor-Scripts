@@ -41,6 +41,8 @@ local config = {
     protect_youth = true,             -- Set to false to disable youth protection
     youth_max_age = 23,               -- Maximum age to be considered a youth player
     youth_potential_bonus = 3,        -- How many points above median team rating the potential must be
+    youth_potential_cap = 85,         -- Hard cap on (median + bonus): if team's median+bonus exceeds this,
+                                      -- youth with potential >= cap are always protected regardless.
     youth_max_protected_per_pos = 1,  -- Maximum number of youth players to protect per position
     
     -- Performance settings
@@ -49,7 +51,14 @@ local config = {
     -- Process control
     convert_non_formation_players = true,  -- Try to convert players not in formation to alternative positions
     release_non_formation_players = true,  -- Release players that don't fit formation (even after conversion attempts)
-    prune_excess_players = true            -- Release excess players beyond the multiplier limit
+    prune_excess_players = true,           -- Release excess players beyond the multiplier limit
+
+    -- Hole-filling safety net
+    -- When a player would be released because their position isn't in formation, they'll instead
+    -- be converted to a formation slot that currently has fewer than min_keep_per_formation_pos
+    -- players, as long as the positions are related (via alternative_positions, bidirectional).
+    min_keep_per_formation_pos = 1,   -- Minimum bodies per formation position before we stop cover-converting
+    cover_bonus_per_pos = 1           -- Ensure at least (formation_count + this) are kept per position in pruning
 }
 
 --------------------------------------------------------------------------------
@@ -79,6 +88,20 @@ local function get_position_name_from_position_id(pid)
     return position_name_by_id[pid] or ("UnknownPos(".. tostring(pid) ..")")
 end
 
+-- Bidirectional cover map derived from config.alternative_positions.
+-- cover_map[Y][X] = true means a player with preferred position X can plausibly cover formation slot Y.
+-- We include both directions (X -> Y from alternative_positions[X], and the reverse) so we can
+-- fill empty formation holes from a wider pool of similar positions.
+local cover_map = {}
+for from_pos, to_list in pairs(config.alternative_positions) do
+    for _, to_pos in ipairs(to_list) do
+        cover_map[to_pos] = cover_map[to_pos] or {}
+        cover_map[to_pos][from_pos] = true
+        cover_map[from_pos] = cover_map[from_pos] or {}
+        cover_map[from_pos][to_pos] = true
+    end
+end
+
 --------------------------------------------------------------------------------
 -- CACHES AND INDEXES
 --------------------------------------------------------------------------------
@@ -88,8 +111,27 @@ local formation_cache = {}
 local team_median_ratings = {}
 local loaned_players = {}
 
+-- Built once from a single scan of teamplayerlinks: team_id -> { player_id, ... }
+-- All per-team roster lookups use this instead of re-scanning the full linking table.
+local team_players_map = nil
+
+-- Built once from a single scan of formations: team_id -> { "GK","CB",... }
+local formations_map = nil
+
+-- Run-wide counters populated during processing; surfaced in the end-of-run summary.
+local run_stats = {
+    teams_processed      = 0,
+    teams_skipped        = 0,
+    conversions          = 0,  -- step 2: non-formation -> alt position in formation
+    cover_conversions    = 0,  -- step 3: convert instead of releasing to fill empty slot
+    releases_step3       = 0,  -- step 3: released because position not in formation
+    releases_step4       = 0,  -- step 4: released as excess beyond multiplier cap
+    youth_protected      = 0,
+    youth_released       = 0
+}
+
 --------------------------------------------------------------------------------
--- HELPER FUNCTIONS - Need to be defined first to avoid circular dependencies
+-- HELPER FUNCTIONS
 --------------------------------------------------------------------------------
 local function calculate_player_age(birth_date)
     if not birth_date or birth_date <= 0 then return 30 end
@@ -105,62 +147,40 @@ end
 --------------------------------------------------------------------------------
 -- PLAYER INDEXING
 --------------------------------------------------------------------------------
-local players_by_position = {} -- Index players by position
-
 local function index_players_by_id()
-    if next(player_cache) ~= nil then 
-        return -- Already indexed
-    end
-    
+    if next(player_cache) ~= nil then return end
+
     LOGGER:LogInfo("Building player index...")
     local start_time = os.time()
     local count = 0
-    
+
     local rec = players_table_global:GetFirstRecord()
     while rec > 0 do
         local pid = players_table_global:GetRecordFieldValue(rec, "playerid")
         if pid then
             local birthdate = players_table_global:GetRecordFieldValue(rec, "birthdate")
             local pref_pos1 = players_table_global:GetRecordFieldValue(rec, "preferredposition1")
-            local pos_name = get_position_name_from_position_id(pref_pos1)
-            
+
             player_cache[pid] = {
                 record = rec,
                 preferredposition1 = pref_pos1,
-                overall = players_table_global:GetRecordFieldValue(rec, "overallrating") or 
+                overall = players_table_global:GetRecordFieldValue(rec, "overallrating") or
                           players_table_global:GetRecordFieldValue(rec, "overall") or 0,
                 potential = players_table_global:GetRecordFieldValue(rec, "potential") or 0,
                 age = calculate_player_age(birthdate),
                 birthdate = birthdate,
-                positionName = pos_name
+                positionName = get_position_name_from_position_id(pref_pos1)
             }
-            
-            -- Index by position
-            if pos_name then
-                players_by_position[pos_name] = players_by_position[pos_name] or {}
-                table.insert(players_by_position[pos_name], pid)
-            end
-            
+
             count = count + 1
-            
-            -- Provide periodic updates for large datasets
             if count % 10000 == 0 then
                 LOGGER:LogInfo(string.format("Indexed %d players so far...", count))
             end
         end
         rec = players_table_global:GetNextValidRecord()
     end
-    
-    local elapsed = os.time() - start_time
-    LOGGER:LogInfo(string.format("Indexed %d players in %d seconds", count, elapsed))
-end
 
--- Get players by position directly from index
-local function get_players_by_position(position_name)
-    -- Make sure players are indexed
-    index_players_by_id()
-    
-    return players_by_position[position_name] or {}
+    LOGGER:LogInfo(string.format("Indexed %d players in %d seconds", count, os.time() - start_time))
 end
 
 --------------------------------------------------------------------------------
@@ -200,68 +220,83 @@ local function is_player_on_loan_from(player_id, team_id)
 end
 
 --------------------------------------------------------------------------------
+-- TEAM -> PLAYERS MAP (single scan)
+--------------------------------------------------------------------------------
+local function build_team_players_map()
+    if team_players_map then return team_players_map end
+    LOGGER:LogInfo("Building team-players map...")
+    local start_time = os.time()
+    team_players_map = {}
+    if not team_player_links_global then return team_players_map end
+
+    local count = 0
+    local rec = team_player_links_global:GetFirstRecord()
+    while rec > 0 do
+        local t_id = team_player_links_global:GetRecordFieldValue(rec, "teamid")
+        local p_id = team_player_links_global:GetRecordFieldValue(rec, "playerid")
+        if t_id and p_id then
+            local bucket = team_players_map[t_id]
+            if not bucket then
+                bucket = {}
+                team_players_map[t_id] = bucket
+            end
+            bucket[#bucket + 1] = p_id
+            count = count + 1
+        end
+        rec = team_player_links_global:GetNextValidRecord()
+    end
+    LOGGER:LogInfo(string.format("Team-players map: %d links in %ds.", count, os.time() - start_time))
+    return team_players_map
+end
+
+--------------------------------------------------------------------------------
 -- GET TEAM PLAYERS
 --------------------------------------------------------------------------------
 local team_player_cache = {} -- Cache team players to avoid redundant lookups
 
 local function get_team_players(team_id)
-    -- Return cached result if available
     if team_player_cache[team_id] then
         return team_player_cache[team_id]
     end
-    
-    -- Make sure players are indexed and loans are tracked
+
     index_players_by_id()
     build_loan_players_index()
-    
+    build_team_players_map()
+
     local players = {}
-    local team_players = {}
-    
-    -- First, collect all player IDs for this team
-    local link_rec = team_player_links_global:GetFirstRecord()
-    while link_rec > 0 do
-        local t_id = team_player_links_global:GetRecordFieldValue(link_rec, "teamid")
-        local p_id = team_player_links_global:GetRecordFieldValue(link_rec, "playerid")
-        
-        if t_id == team_id and p_id then
-            team_players[p_id] = true
-        end
-        link_rec = team_player_links_global:GetNextValidRecord()
-    end
-    
-    -- Then process all players in one go
-    for p_id in pairs(team_players) do
-        -- Skip players who are on loan to other teams
-        if is_player_on_loan_from(p_id, team_id) then
-            LOGGER:LogInfo(string.format("Skipping player %d who is on loan from team %d", p_id, team_id))
-        else
-            local cached_player = player_cache[p_id]
-            if cached_player then
-                local pref_pos = cached_player.preferredposition1 or 0
-                local pos_name = get_position_name_from_position_id(pref_pos)
-                players[#players + 1] = {
-                    id = p_id,
-                    posName = pos_name,
-                    overall = cached_player.overall,
-                    potential = cached_player.potential,
-                    age = cached_player.age
-                }
+    local ids = team_players_map[team_id]
+    if ids then
+        for _, p_id in ipairs(ids) do
+            if not is_player_on_loan_from(p_id, team_id) then
+                local cached_player = player_cache[p_id]
+                if cached_player then
+                    local pref_pos = cached_player.preferredposition1 or 0
+                    players[#players + 1] = {
+                        id = p_id,
+                        posName = get_position_name_from_position_id(pref_pos),
+                        overall = cached_player.overall,
+                        potential = cached_player.potential,
+                        age = cached_player.age
+                    }
+                end
             end
         end
     end
-    
-    -- Cache the result
+
     team_player_cache[team_id] = players
     return players
 end
 
--- Function to invalidate team player cache when players are updated/released
+-- Function to invalidate team player cache when players are updated/released.
+-- Also invalidates the cached median rating so downstream youth-potential checks
+-- stay accurate as the roster changes during processing.
 local function invalidate_team_player_cache(team_id)
     if team_id then
         team_player_cache[team_id] = nil
+        team_median_ratings[team_id] = nil
     else
-        -- Invalidate all teams if no specific team is provided
         team_player_cache = {}
+        team_median_ratings = {}
     end
 end
 
@@ -294,49 +329,48 @@ local function calculate_team_median_rating(team_id)
     -- Ensure median is stored as integer for proper string formatting
     median = math.floor(median + 0.5)
     team_median_ratings[team_id] = median
-    
-    LOGGER:LogInfo(string.format("Team %d median rating calculated: %d", team_id, median))
     return median
 end
 
 --------------------------------------------------------------------------------
 -- GET FORMATION POSITIONS
 --------------------------------------------------------------------------------
--- Returns a table of e.g. {"GK","CB","CB","ST","CM",...}
-local function get_formation_positions(team_id)
-    if formation_cache[team_id] then
-        return formation_cache[team_id]
-    end
-    
-    if not formations_table_global then
-        formation_cache[team_id] = {}
-        return {}
-    end
-    
+-- Build formations map once: team_id -> {"GK","CB","CB",...}
+local function build_formations_map()
+    if formations_map then return formations_map end
+    formations_map = {}
+    if not formations_table_global then return formations_map end
+
     local rec = formations_table_global:GetFirstRecord()
     while rec > 0 do
-        local f_team_id = formations_table_global:GetRecordFieldValue(rec, "teamid")
-        if f_team_id == team_id then
+        local t_id = formations_table_global:GetRecordFieldValue(rec, "teamid")
+        if t_id then
             local positions = {}
             for i = 0, 10 do
-                local field_name = ("position%d"):format(i)
-                local pos_id = formations_table_global:GetRecordFieldValue(rec, field_name) or 0
-                local pos_name = get_position_name_from_position_id(pos_id)
-                positions[#positions + 1] = pos_name
+                local pos_id = formations_table_global:GetRecordFieldValue(rec, ("position%d"):format(i)) or 0
+                positions[#positions + 1] = get_position_name_from_position_id(pos_id)
             end
-            formation_cache[team_id] = positions
-            return positions
+            formations_map[t_id] = positions
         end
         rec = formations_table_global:GetNextValidRecord()
     end
-    
-    formation_cache[team_id] = {}
-    return {}
+    return formations_map
+end
+
+-- Returns a table of e.g. {"GK","CB","CB","ST","CM",...}
+local function get_formation_positions(team_id)
+    if formation_cache[team_id] then return formation_cache[team_id] end
+    build_formations_map()
+    local positions = formations_map[team_id] or {}
+    formation_cache[team_id] = positions
+    return positions
 end
 
 --------------------------------------------------------------------------------
 -- Update Position + Roles
 --------------------------------------------------------------------------------
+-- Note: these helpers are intentionally quiet now; the conversion callers log a
+-- single consolidated line per player so we don't get 3+ lines per conversion.
 local function update_player_preferred_position_1(player_id, new_pos_id, players_table)
     local player = player_cache[player_id]
     if not player then
@@ -350,24 +384,18 @@ local function update_player_preferred_position_1(player_id, new_pos_id, players
     local pos3 = players_table:GetRecordFieldValue(rec, "preferredposition3")
 
     players_table:SetRecordFieldValue(rec, "preferredposition1", new_pos_id)
-    LOGGER:LogInfo(string.format("Updated player %d pos1 to %d.", player_id, new_pos_id))
-    
-    -- Update our cache
     player.preferredposition1 = new_pos_id
 
     if new_pos_id == 0 then
-        LOGGER:LogInfo(string.format("Player %d is GK -> clearing pos2/pos3.", player_id))
         players_table:SetRecordFieldValue(rec, "preferredposition2", -1)
         players_table:SetRecordFieldValue(rec, "preferredposition3", -1)
         return
     end
     if pos2 == new_pos_id then
         players_table:SetRecordFieldValue(rec, "preferredposition2", old)
-        LOGGER:LogInfo(string.format("Swapped pos2 with old pos1(%d).", old))
     end
     if pos3 == new_pos_id then
         players_table:SetRecordFieldValue(rec, "preferredposition3", old)
-        LOGGER:LogInfo(string.format("Swapped pos3 with old pos1(%d).", old))
     end
 end
 
@@ -380,13 +408,10 @@ local function update_all_player_roles(player_id, r1, r2, r3, players_table)
 
     local rec = player.record
     local pos = players_table:GetRecordFieldValue(rec, "preferredposition1")
-    if pos == 0 then
-        r3 = 0
-    end
+    if pos == 0 then r3 = 0 end
     players_table:SetRecordFieldValue(rec, "role1", r1)
     players_table:SetRecordFieldValue(rec, "role2", r2)
     players_table:SetRecordFieldValue(rec, "role3", r3)
-    LOGGER:LogInfo(string.format("Updated player %d's roles to %d,%d,%d.", player_id, r1, r2, r3))
 end
 
 --------------------------------------------------------------------------------
@@ -396,14 +421,17 @@ local function is_high_potential_youth(player, team_median_rating)
     if not config.protect_youth then
         return false
     end
-    
-    -- Check if this is a young player
+
     if player.age > config.youth_max_age then
         return false
     end
-    
-    -- Check if potential is significantly above median
+
+    -- median + bonus, capped: elite squads still have to accept youth with potential >= cap
     local potential_threshold = team_median_rating + config.youth_potential_bonus
+    local cap = config.youth_potential_cap
+    if cap and potential_threshold > cap then
+        potential_threshold = cap
+    end
     return player.potential >= potential_threshold
 end
 
@@ -423,7 +451,6 @@ local function try_convert_player(player_id, old_posName, formation_set, team_id
     
     for _, alt_pos in ipairs(alt_list) do
         if formation_set[alt_pos] then
-            -- Convert to alt_pos
             local new_pos_id = get_position_id_from_position_name(alt_pos)
             update_player_preferred_position_1(player_id, new_pos_id, players_table_global)
 
@@ -431,9 +458,8 @@ local function try_convert_player(player_id, old_posName, formation_set, team_id
             if roles then
                 update_all_player_roles(player_id, roles[1], roles[2], roles[3], players_table_global)
             end
-            LOGGER:LogInfo(string.format("Converted player %d from %s to %s", player_id, old_posName, alt_pos))
-            
-            -- Invalidate cache after position change
+            LOGGER:LogInfo(string.format("Converted %d: %s -> %s.", player_id, old_posName, alt_pos))
+
             invalidate_team_player_cache(team_id)
             return true
         end
@@ -442,25 +468,88 @@ local function try_convert_player(player_id, old_posName, formation_set, team_id
 end
 
 --------------------------------------------------------------------------------
+-- COVER EMPTY FORMATION SLOT (before step 3 release)
+--------------------------------------------------------------------------------
+-- If a non-formation player is about to be released and the team has a formation
+-- slot below the min_keep_per_formation_pos threshold that this player can
+-- plausibly cover (via the bidirectional cover_map), convert them to fill it
+-- instead of releasing. Mutates `have` in place on success.
+local function try_cover_empty_formation_slot(player_id, old_posName, formation_set, have, team_id)
+    if loaned_players[player_id] then
+        return false
+    end
+
+    local min_keep = config.min_keep_per_formation_pos or 1
+    local candidates = cover_map[old_posName]
+    if not candidates then
+        return false
+    end
+
+    -- Deterministic iteration order so logs are easier to follow
+    local empty_positions = {}
+    for form_pos in pairs(formation_set) do
+        if candidates[form_pos] and (have[form_pos] or 0) < min_keep then
+            empty_positions[#empty_positions + 1] = form_pos
+        end
+    end
+    if #empty_positions == 0 then
+        return false
+    end
+    table.sort(empty_positions, function(a, b)
+        return (have[a] or 0) < (have[b] or 0)
+    end)
+
+    local target_pos = empty_positions[1]
+    local new_pos_id = get_position_id_from_position_name(target_pos)
+    update_player_preferred_position_1(player_id, new_pos_id, players_table_global)
+
+    local roles = config.positions_to_roles[target_pos]
+    if roles then
+        update_all_player_roles(player_id, roles[1], roles[2], roles[3], players_table_global)
+    end
+
+    LOGGER:LogInfo(string.format(
+        "Cover-converted %d: %s -> %s (slot had %d, min %d).",
+        player_id, old_posName, target_pos, have[target_pos] or 0, min_keep
+    ))
+
+    have[target_pos] = (have[target_pos] or 0) + 1
+    invalidate_team_player_cache(team_id)
+    return true
+end
+
+--------------------------------------------------------------------------------
 -- RELEASE A PLAYER (Step 3)
 --------------------------------------------------------------------------------
 local function release_player(player_id, team_id)
-    -- Never release loaned players
     if loaned_players[player_id] then
-        LOGGER:LogInfo(string.format("Skipping release of player %d who is on loan from team %d", player_id, team_id))
+        -- silently skip loaned players; this was noisy in logs
         return false
     end
-    
+
     local success = pcall(function()
         ReleasePlayerFromTeam(player_id)
     end)
-    
+
     if success then
-        local player_name = GetPlayerName(player_id)
-        local team_name = GetTeamName(team_id)
-        LOGGER:LogInfo(string.format("Released player %s (ID: %d) from %s (ID: %d).", player_name, player_id, team_name, team_id))
-        
-        -- Invalidate cache for this team
+        LOGGER:LogInfo(string.format(
+            "Released %s (%d) from %s (%d).",
+            GetPlayerName(player_id), player_id, GetTeamName(team_id), team_id
+        ))
+
+        -- Keep the team->players map in sync so subsequent rebuilds are correct.
+        if team_players_map then
+            local bucket = team_players_map[team_id]
+            if bucket then
+                for i = 1, #bucket do
+                    if bucket[i] == player_id then
+                        bucket[i] = bucket[#bucket]
+                        bucket[#bucket] = nil
+                        break
+                    end
+                end
+            end
+        end
         invalidate_team_player_cache(team_id)
         return true
     else
@@ -486,6 +575,7 @@ local function process_team(team_id)
     if #formation_positions == 0 then
         LOGGER:LogInfo(string.format("No formation found for team %s. Skipping steps.", team_name))
         teams_processed[team_id] = true
+        run_stats.teams_skipped = run_stats.teams_skipped + 1
         return
     end
 
@@ -513,35 +603,62 @@ local function process_team(team_id)
             end
         end
         
-        -- Process conversions
         for _, ply in ipairs(players_to_convert) do
             local success = try_convert_player(ply.id, ply.posName, formation_set, team_id)
             if success then conversions = conversions + 1 end
         end
-        LOGGER:LogInfo(string.format("Converted %d players to formation positions", conversions))
+        if conversions > 0 then
+            LOGGER:LogInfo(string.format("Step 2: converted %d to formation positions.", conversions))
+        end
+        run_stats.conversions = run_stats.conversions + conversions
     else
         LOGGER:LogInfo("Player position conversion is disabled in config")
     end
 
     -- 3) Release leftover mismatches (including high potential youth that couldn't be converted)
     local releases = 0
+    local cover_conversions = 0
     if config.release_non_formation_players then
         -- We need to refresh the player list as positions may have changed
         invalidate_team_player_cache(team_id)
         players_list = get_team_players(team_id)
-        
+
+        -- Count current bodies per formation position so cover-before-release can
+        -- target the slots that are actually below min_keep_per_formation_pos.
+        local have = {}
+        for _, ply in ipairs(players_list) do
+            if formation_set[ply.posName] then
+                have[ply.posName] = (have[ply.posName] or 0) + 1
+            end
+        end
+
         local players_to_release = {}
         for _, ply in ipairs(players_list) do
             if not formation_set[ply.posName] then
                 table.insert(players_to_release, ply)
             end
         end
-        
+
+        -- Try to convert the best-rated non-formation players into empty slots first,
+        -- so if we only have one body to spare, the better player covers the hole.
+        table.sort(players_to_release, function(a, b) return a.overall > b.overall end)
+
         for _, ply in ipairs(players_to_release) do
-            local success = release_player(ply.id, team_id)
-            if success then releases = releases + 1 end
+            if try_cover_empty_formation_slot(ply.id, ply.posName, formation_set, have, team_id) then
+                cover_conversions = cover_conversions + 1
+            else
+                local success = release_player(ply.id, team_id)
+                if success then releases = releases + 1 end
+            end
         end
-        LOGGER:LogInfo(string.format("Released %d players not matching formation positions", releases))
+        if cover_conversions > 0 or releases > 0 then
+            LOGGER:LogInfo(string.format(
+                "Step 3: cover-converted %d, released %d (non-formation).",
+                cover_conversions, releases
+            ))
+        end
+        run_stats.cover_conversions = run_stats.cover_conversions + cover_conversions
+        run_stats.releases_step3 = run_stats.releases_step3 + releases
     else
         LOGGER:LogInfo("Non-formation player release is disabled in config")
     end
@@ -562,17 +679,27 @@ local function process_team(team_id)
         for posName, arr in pairs(grouped) do
             local demand_for_pos = formation_count[posName] or 0
             if demand_for_pos > 0 then
-                local max_for_pos = demand_for_pos * config.multiplier
-                
+                -- Ensure we always keep at least (formation_count + cover_bonus_per_pos) bodies
+                -- in addition to respecting the multiplier-based cap.
+                local min_keep_for_pos = math.max(
+                    demand_for_pos + (config.cover_bonus_per_pos or 0),
+                    config.min_keep_per_formation_pos or 1
+                )
+                local max_for_pos = math.max(demand_for_pos * config.multiplier, min_keep_for_pos)
+
                 if #arr > max_for_pos then
                     -- Sort all players by overall first (descending)
-                    table.sort(arr, function(a, b) 
-                        return a.overall > b.overall 
+                    table.sort(arr, function(a, b)
+                        return a.overall > b.overall
                     end)
-                    
-                    -- Calculate how many slots in the last third are available for youth
-                    local regular_slots = math.floor(max_for_pos * 2/3)
-                    local youth_eligible_slots = max_for_pos - regular_slots
+
+                    -- Youth cap: up to config.youth_max_protected_per_pos slots, but never
+                    -- enough to push out a starter-quality player (i.e. regulars >= demand).
+                    local youth_eligible_slots = math.min(
+                        config.youth_max_protected_per_pos or 1,
+                        math.max(0, max_for_pos - demand_for_pos)
+                    )
+                    local regular_slots = max_for_pos - youth_eligible_slots
                     
                     -- First identify ALL high potential youth players
                     local all_youth_candidates = {}
@@ -606,10 +733,11 @@ local function process_team(team_id)
                         if not candidate.is_in_top_overall and youth_added < youth_eligible_slots then
                             players_to_keep[candidate.player.id] = true
                             youth_added = youth_added + 1
-                            
+                            run_stats.youth_protected = run_stats.youth_protected + 1
+
                             LOGGER:LogInfo(string.format(
-                                "Protected youth player %d (OVR: %d, POT: %d, Age: %d) in position %s",
-                                candidate.player.id, candidate.player.overall, 
+                                "Protected youth %d (OVR %d, POT %d, Age %d) at %s.",
+                                candidate.player.id, candidate.player.overall,
                                 candidate.player.potential, candidate.player.age, posName
                             ))
                         end
@@ -633,21 +761,15 @@ local function process_team(team_id)
                             if release_player(player.id, team_id) then
                                 released = released + 1
                                 position_releases = position_releases + 1
-                                
-                                -- Log release of high potential youth
                                 if is_high_potential_youth(player, team_median) then
-                                    LOGGER:LogInfo(string.format(
-                                        "Released youth player %d (OVR: %d, POT: %d, Age: %d) - not in top %d slots for %s",
-                                        player.id, player.overall, player.potential, player.age, 
-                                        max_for_pos, posName
-                                    ))
+                                    run_stats.youth_released = run_stats.youth_released + 1
                                 end
                             end
                         end
                     end
-                    
+
                     LOGGER:LogInfo(string.format(
-                        "Position %s had %d players, kept %d top overall and %d high potential youth, released %d",
+                        "Step 4 %s: %d -> kept %d top + %d youth, released %d.",
                         posName, #arr, regular_slots, youth_added, released
                     ))
                 end
@@ -659,38 +781,26 @@ local function process_team(team_id)
 
     local elapsed = os.time() - start_time
     LOGGER:LogInfo(string.format(
-        "Done processing team %s (%d) in %d seconds. Total releases: %d",
-        team_name, team_id, elapsed, releases + position_releases
+        "Done team %s (%d) in %ds: %d released (step3:%d, step4:%d).",
+        team_name, team_id, elapsed, releases + position_releases, releases, position_releases
     ))
+    run_stats.releases_step4 = run_stats.releases_step4 + position_releases
+    run_stats.teams_processed = run_stats.teams_processed + 1
     teams_processed[team_id] = true
 end
 
 --------------------------------------------------------------------------------
 -- BUILD TEAM POOL
 --------------------------------------------------------------------------------
-local league_team_map = {}
-
 local function build_team_pool()
-    if next(league_team_map) ~= nil then
-        -- Use cached league-team map if available
-        local pool = {}
-        for _, league_id in ipairs(config.target_leagues) do
-            local teams_in_league = league_team_map[league_id] or {}
-            for _, t_id in ipairs(teams_in_league) do
-                if not config.excluded_teams[t_id] then
-                    pool[#pool + 1] = t_id
-                end
-            end
-        end
-        return pool
-    end
-    
     local pool = {}
     if not league_team_links_global then
         LOGGER:LogWarning("No league_team_links table found. Pool will be empty.")
         return pool
     end
 
+    -- Single pass: index league -> {team_id,...}, then flatten for the target leagues.
+    local league_team_map = {}
     local rec = league_team_links_global:GetFirstRecord()
     while rec > 0 do
         local league_id = league_team_links_global:GetRecordFieldValue(rec, "leagueid")
@@ -703,8 +813,7 @@ local function build_team_pool()
     end
 
     for _, league_id in ipairs(config.target_leagues) do
-        local teams_in_league = league_team_map[league_id] or {}
-        for _, t_id in ipairs(teams_in_league) do
+        for _, t_id in ipairs(league_team_map[league_id] or {}) do
             if not config.excluded_teams[t_id] then
                 pool[#pool + 1] = t_id
             end
@@ -850,10 +959,8 @@ local function do_position_changes()
         end
     end
     
-    -- Add progress tracking
     local total_teams = #team_pool
-    local last_save_time = os.time()
-    
+
     for idx = current_idx, total_teams do
         local team_id = team_pool[idx]
         
@@ -881,39 +988,42 @@ local function do_position_changes()
             LOGGER:LogError(string.format("Error processing team %d: %s", team_id, tostring(err)))
         end
         
-        -- Save progress periodically based on batch size
         if idx % config.batch_size == 0 or idx == total_teams then
             save_progress(idx + 1, team_pool, success_count, error_count)
-            last_save_time = os.time()
         end
     end
     
     local total_elapsed = os.time() - start_time
-    LOGGER:LogInfo(string.format(
-        "Done processing all target teams in %d seconds. Success: %d, Errors: %d", 
-        total_elapsed, success_count, error_count
-    ))
-    
-    -- Show results in message box for user
-    MessageBox("Processing Complete", string.format(
-        "Processed %d teams\nSuccess: %d\nErrors: %d\nTotal time: %d seconds",
-        total_teams - (current_idx - 1), success_count, error_count, total_elapsed
-    ))
-    
-    -- Remove progress file when complete
-    os.remove("release_players_progress.dat")
-end
+    local total_released = run_stats.releases_step3 + run_stats.releases_step4
+    local total_converted = run_stats.conversions + run_stats.cover_conversions
 
---------------------------------------------------------------------------------
--- ERROR HANDLING UTILITIES
---------------------------------------------------------------------------------
-local function protected_call(func, ...)
-    local success, result = pcall(func, ...)
-    if not success then
-        LOGGER:LogError("Error: " .. tostring(result))
-        return nil
-    end
-    return result
+    LOGGER:LogInfo("=== Release run summary ===")
+    LOGGER:LogInfo(string.format(
+        "Teams processed: %d (errors %d, no-formation skipped %d).",
+        success_count, error_count, run_stats.teams_skipped
+    ))
+    LOGGER:LogInfo(string.format(
+        "Conversions: %d total (step2 %d, cover %d).",
+        total_converted, run_stats.conversions, run_stats.cover_conversions
+    ))
+    LOGGER:LogInfo(string.format(
+        "Releases: %d total (step3 non-formation %d, step4 excess %d).",
+        total_released, run_stats.releases_step3, run_stats.releases_step4
+    ))
+    LOGGER:LogInfo(string.format(
+        "Youth: protected %d, released %d. Elapsed: %ds.",
+        run_stats.youth_protected, run_stats.youth_released, total_elapsed
+    ))
+
+    MessageBox("Processing Complete", string.format(
+        "Teams: %d (errors %d).\nConverted: %d (step2 %d / cover %d).\nReleased: %d (step3 %d / step4 %d).\nYouth: protected %d, released %d.\nTime: %ds.",
+        success_count, error_count,
+        total_converted, run_stats.conversions, run_stats.cover_conversions,
+        total_released, run_stats.releases_step3, run_stats.releases_step4,
+        run_stats.youth_protected, run_stats.youth_released, total_elapsed
+    ))
+    
+    os.remove("release_players_progress.dat")
 end
 
 --------------------------------------------------------------------------------
@@ -923,6 +1033,3 @@ math.randomseed(os.time())
 LOGGER:LogInfo("Starting Team Formation Position Management Script...")
 
 do_position_changes()
-
-
-
